@@ -1,0 +1,22 @@
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0
+  },
+  "mappings": {
+    "properties": {
+      "message_id": { "type": "keyword" },
+      "session_id": { "type": "keyword" },
+      "user_id": { "type": "keyword" },
+      "role": { "type": "keyword" },
+      "content": { "type": "text" },
+      "created_at": { "type": "date" },
+      "embedding": {
+        "type": "dense_vector",
+        "dims": 384,
+        "index": true,
+        "similarity": "cosine"
+      }
+    }
+  }
+}

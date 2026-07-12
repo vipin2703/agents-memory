@@ -1,205 +1,246 @@
-# Local LLM Stack
+# Local LLM Stack + Agent Memory
 
-Local Docker stack: **chat client → FastAPI backend → vLLM (GPU) → model**, with **Langfuse** tracing.
+Local Docker stack: **chat client → FastAPI backend → vLLM (GPU)** with **agent memory** (SQL + Elasticsearch + Neo4j) and optional **Langfuse** tracing.
 
 ---
 
 ## 1. Architecture (big picture)
 
 ```
-┌────────────────────────────────────────────────────────────────────────────────┐
-│  HOST                                                                          │
-│                                                                                │
-│  ┌────────────────┐   :5000    ┌──────────────────┐   :8000/v1  ┌───────────┐  │
-│  │ chat_client.py │ ─────────► │ backend          │ ──────────► │ vLLM      │  │
-│  │ messages+facts │ ◄───────── │ llm_serve :5000  │ ◄────────── │ GPU :8000 │  │
-│  └────────────────┘  answer +  └────────┬─────────┘             └───────────┘  │
-│                       facts             │ traces (async)                       │
-│                                         ▼                                      │
-│                              ┌──────────────────────┐                          │
-│                              │ langfuse-web :3000   │  UI + API                │
-│                              └──────────┬───────────┘                          │
-│                                         │ enqueue                              │
-│                                         ▼                                      │
-│                              ┌──────────────────────┐                          │
-│                              │ Redis :6379          │  queue                   │
-│                              └──────────┬───────────┘                          │
-│                                         │ drain                                │
-│                                         ▼                                      │
-│                              ┌──────────────────────┐                          │
-│                              │ langfuse-worker      │  :3030                   │
-│                              │ Redis → storage      │                          │
-│                              └──────────┬───────────┘                          │
-│                    ┌────────────────────┼────────────────────┐                 │
-│                    ▼                    ▼                    ▼                 │
-│           ┌──────────────┐    ┌──────────────┐    ┌──────────────┐             │
-│           │ ClickHouse   │    │ Postgres     │    │ MinIO        │             │
-│           │ :8123 / :9000│    │ :5433→5432   │    │ :9090→9000   │             │
-│           │ (traces)     │    │ (meta/users) │    │ (blobs)      │             │
-│           └──────────────┘    └──────────────┘    └──────────────┘             │
-└────────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│  HOST                                                                              │
+│                                                                                    │
+│  chat_client.py                                                                    │
+│       │  POST :5000/chat/structured/stream  (live answer + facts)                  │
+│       ▼                                                                            │
+│  backend (llm_serve :5000)                                                         │
+│       │  1) recall memory                                                          │
+│       │  2) 1× structured LLM call (answer + extracted_facts)                      │
+│       │  3) write teeno stores                                                     │
+│       ├──────────────────┬───────────────────┬──────────────────┐                  │
+│       ▼                  ▼                   ▼                  ▼                  │
+│  vLLM :8000      Postgres           Elasticsearch :9200    Neo4j :7687/:7474       │
+│  guided JSON     agent_memory DB    BM25 + dense_vector    entities + RELATES_TO   │
+│                  (transcript)       (search index)         (knowledge graph)       │
+│       │                                                                            │
+│       │ traces (async)                                                             │
+│       ▼                                                                            │
+│  Langfuse :3000 → Redis :6379 → worker :3030 → ClickHouse / Postgres / MinIO        │
+└────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 | Service | Host port | Job |
 |---------|-----------|-----|
-| `chat_client.py` | — | Terminal chat, history + facts memory |
-| `backend` (`llm_serve`) | **5000** | FastAPI: routes, memory inject, structured proxy |
-| `vllm-server` | **8000** | Model serve + guided JSON (xgrammar) |
-| `langfuse-web` | **3000** | Langfuse UI + ingest API |
-| `langfuse-worker` | **3030** | Redis se traces uthata hai → ClickHouse/Postgres/MinIO |
-| `Redis` | **6379** | Trace queue (localhost only) |
-| `ClickHouse` | **8123** (HTTP), **9000** (native) | Trace/log store (localhost only) |
-| `Postgres` | **5433** → container 5432 | Users, projects, API keys (localhost only) |
-| `MinIO` | **9090** → container 9000 | Object storage for media/events |
+| `chat_client.py` | — | Live stream chat + local facts cache |
+| `backend` (`llm_serve`) | **5000** | FastAPI: chat, structured stream, memory API |
+| `vllm-server` | **8000** | Model + guided JSON (xgrammar) |
+| `postgres` | **5433**→5432 | Langfuse meta + DB `agent_memory` (chat truth) |
+| `elasticsearch` | **9200** | Full-text + dense_vector field |
+| `neo4j` | **7474** / **7687** | Knowledge graph |
+| `memory-migrate` | one-shot | SQL schema |
+| `elasticsearch-migrate` | one-shot | ES index |
+| `neo4j-migrate` | one-shot | Neo4j constraints |
+| `langfuse-web` | **3000** | Traces UI |
+| `langfuse-worker` | **3030** | Redis → storage |
+| Redis / ClickHouse / MinIO | **6379** / **8123** / **9090** | Langfuse stack |
 
 ---
 
-## 2. Run (4 steps)
+## 2. Run
 
-1. Env: `config/.env.example` → `config/.env` · `backend/vllm/.env.example` → `backend/vllm/.env` · model path + secrets set karo  
-2. Start: `cd config` → `docker compose up -d --build`  
-3. Wait: GPU + vLLM model load  
-4. Chat: root se `python chat_client.py`  
-   - `facts` = memory · `clear` = wipe · `exit` = quit  
+1. **Env**
+   - `config/.env` (model path, GPU, Postgres, Neo4j auth, …)
+   - `backend/vllm/.env` (BASE_URL, MODEL_NAME, Langfuse keys)
+   - `backend/agent_memory/.env` (MEMORY_DATABASE_URL, ES, Neo4j)
 
-| Service | URL / port |
-|---------|------------|
-| Backend | http://localhost:5000 |
-| vLLM | http://localhost:8000 |
-| Langfuse UI | http://localhost:3000 |
-| Langfuse worker | http://127.0.0.1:3030 |
-| Redis | 127.0.0.1:6379 |
-| ClickHouse HTTP | http://127.0.0.1:8123 |
-| ClickHouse native | 127.0.0.1:9000 |
-| Postgres | 127.0.0.1:5433 |
-| MinIO | http://localhost:9090 |
+2. **Start**
+   ```powershell
+   cd config
+   docker compose up -d --build
+   ```
+   Order: Postgres/ES/Neo4j healthy → **3 migrates** → backend. vLLM model load alag se time lega.
+
+3. **Check migrates**
+   ```powershell
+   docker compose logs memory-migrate elasticsearch-migrate neo4j-migrate
+   ```
+
+4. **Health**
+   - http://localhost:5000/health  
+   - http://localhost:5000/memory/health  
+
+5. **Chat**
+   ```powershell
+   cd ..
+   python chat_client.py
+   ```
+   | Command | Action |
+   |---------|--------|
+   | (type message) | live answer stream + facts/relations |
+   | `facts` | local facts cache |
+   | `health` | memory stores |
+   | `recall` / `recall <q>` | server memory block |
+   | `clear` | local + session transcript (KG kept) |
+   | `wipe` | full user wipe (SQL+ES+KG) |
+   | `exit` | quit |
+
+| URL | Service |
+|-----|---------|
+| http://localhost:5000 | Backend |
+| http://localhost:8000 | vLLM |
+| http://localhost:3000 | Langfuse |
+| http://localhost:9200 | Elasticsearch |
+| http://localhost:7474 | Neo4j Browser |
+| bolt://localhost:7687 | Neo4j Bolt |
+| http://localhost:5000/memory/health | Memory health |
+
+Schema dubara apply (safe re-run):
+```powershell
+cd config
+docker compose run --rm memory-migrate
+docker compose run --rm elasticsearch-migrate
+docker compose run --rm neo4j-migrate
+```
 
 ---
 
-## 3. Request flow (one chat turn)
+## 3. One chat turn (agent memory)
 
 ```
- You type message
+You type message
         │
         ▼
-┌───────────────────────────────────┐
-│ 1. chat_client.py                 │
-│    · user msg → messages[]        │
-│    · payload = messages + memory  │
-│    · POST /chat/structured        │
-└─────────────────┬─────────────────┘
-                  │
-                  ▼
-┌───────────────────────────────────┐
-│ 2. routes.py                      │
-│    · validate ChatRequest         │
-│    · call run_chat_structured()   │
-└─────────────────┬─────────────────┘
-                  │
-                  ▼
-┌───────────────────────────────────┐
-│ 3. client.py                      │
-│    · system prompt + MEMORY block │
-│    · guided JSON schema           │
-│      { answer, extracted_facts }  │
-│    · AsyncOpenAI → vLLM           │
-│    · @observe → Langfuse (side)   │
-└─────────────────┬─────────────────┘
-                  │
-                  ▼
-┌───────────────────────────────────┐
-│ 4. vLLM (GPU)                     │
-│    · 1 generation (single call)   │
-│    · answer + entities / facts /  │
-│      constraints (schema-forced)  │
-└─────────────────┬─────────────────┘
-                  │
-                  ▼
-┌───────────────────────────────────┐
-│ 5. Response back                  │
-│    backend → client               │
-│    · print answer                 │
-│    · merge extracted_facts        │
-│      into local memory            │
-│    · next turn: memory re-sent    │
-└───────────────────────────────────┘
+chat_client → POST /chat/structured/stream
+        │
+        ▼
+1. RECALL  (best-effort)
+   · Neo4j: entities, facts, constraints, relations
+   · Elasticsearch: related past (query = user text)
+   · SQL: recent session (optional in block)
+   · → system MEMORY inject
+        │
+        ▼
+2. SINGLE LLM CALL (vLLM guided JSON)
+   · stream answer tokens live (answer_delta)
+   · then extracted_facts (final event)
+   · shape:
+     {
+       "answer": "...",                 // complete reply first
+       "extracted_facts": {
+         "entities": [],
+         "facts_about_user": [],
+         "constraints": [],
+         "relations": [                 // subject-predicate-object
+           {"subject":"Rahul","predicate":"LIVES_IN","object":"Pune"}
+         ]
+       }
+     }
+   · facts/relations: latest user message only + code grounding filter
+        │
+        ▼
+3. WRITE
+   · SQL: messages append + turn_facts (entities, facts, constraints, relations)
+   · Elasticsearch: message doc append
+   · Neo4j: MERGE entities/facts + RELATES_TO edges
+        │
+        ▼
+Client: live Bot print + merge local facts cache
 ```
 
-**Memory loop:** turn N ke facts → client store → turn N+1 ke system prompt me inject → model yaad rakhta hai.
+**Still 1 LLM call** (cost) — recall/write stores are not extra LLM calls.
 
 ---
 
-## 4. Backend internal flow
+## 4. Agent memory design
+
+| Store | What | Write style |
+|-------|------|-------------|
+| **SQL** (`agent_memory`) | Episodic transcript + per-turn fact snapshot | **append** |
+| **Elasticsearch** | Searchable messages (BM25; dense_vector ready) | **append** docs |
+| **Neo4j** | Semantic graph: entities, facts, **relations** | **MERGE / upsert** |
+
+```
+SQL (truth tape)     ←── every message
+ES (find past)       ←── every message  
+Neo4j (belief graph) ←── verified entities + relations
+```
+
+### Neo4j graph shape
+
+```
+(:User)-[:MENTIONED]->(:Entity)
+(:User)-[:HAS_FACT]->(:UserFact)
+(:User)-[:HAS_CONSTRAINT]->(:Constraint)
+(:Entity)-[:RELATES_TO {predicate, user_id}]->(:Entity)
+```
+
+### Schema = migrate, not app boot
+
+| Store | File | Compose job |
+|-------|------|-------------|
+| Postgres | `agent_memory/sql/schema.sql` | `memory-migrate` |
+| Elasticsearch | `agent_memory/elasticsearch/index.json` | `elasticsearch-migrate` |
+| Neo4j | `agent_memory/knowledge_graph/schema.cypher` | `neo4j-migrate` |
+
+App only DML / index docs / MERGE — **no CREATE TABLE/index on request path**.
+
+### Anti-hallucination (single-call, no 2× tokens)
+
+- Prompt: extract **only from latest user message**, not from model answer  
+- After LLM: **code filter** — entity/fact/relation subject+object must ground in user text; else drop  
+- Empty arrays better than inventing  
+
+### Streaming API
+
+| Endpoint | Behavior |
+|----------|----------|
+| `POST /chat/structured` | Full JSON response |
+| `POST /chat/structured/stream` | SSE: `answer_delta` live → `final` (facts + memory_status) |
+| `POST /memory/write` · `/recall` · `/health` | Direct memory API |
+| `DELETE /memory/session` · `/memory/user/{id}` | Clear session / wipe user |
+
+---
+
+## 5. Backend layout
 
 ```
 main.py
-  └── include_router(vllm)
-        │
-        ├── schemas.py     shape + defaults (temperature, max_tokens, memory)
-        ├── routes.py      HTTP only — no LLM logic
-        │     /health
-        │     /chat              → plain text
-        │     /chat/structured   → answer + extracted_facts   ★ main path
-        │     /chat/stream       → SSE tokens
-        └── client.py      business logic only
-              run_chat()
-              run_chat_structured()   ← guided decoding, 1 LLM call
-              run_chat_stream()
+  ├── vllm router
+  │     /health
+  │     /chat
+  │     /chat/structured
+  │     /chat/structured/stream   ★ live + facts
+  │     /chat/stream
+  └── agent_memory router
+        /memory/*
 ```
 
-**Design:** feature slice — `vllm/` me routes + client + schemas ek saath. Naya service = naya folder + `main.py` me router.
+```
+backend/
+├── vllm/                 # LLM client, guided JSON, stream parse
+└── agent_memory/
+    ├── sql/              # Postgres only
+    ├── elasticsearch/    # ES only
+    ├── knowledge_graph/  # Neo4j only (store.py)
+    ├── service.py        # orchestrate 3 stores
+    ├── bridge.py         # chat recall/write glue
+    ├── routes.py
+    └── schemas.py
+```
 
 ---
 
-## 5. Structured output (1 LLM call)
+## 6. Langfuse (side path)
 
 ```
-                    ┌─────────────────────────────┐
-  user + memory ──► │  vLLM guided JSON (xgrammar)│
-                    │                             │
-                    │  {                          │
-                    │    "answer": "...",         │  ← user-facing reply
-                    │    "extracted_facts": {     │
-                    │      "entities": [],        │  ← max 8
-                    │      "facts_about_user": [],│
-                    │      "constraints": []      │
-                    │    }                        │
-                    │  }                          │
-                    └─────────────────────────────┘
+LLM call → langfuse SDK → langfuse-web:3000
+                              → Redis queue
+                              → langfuse-worker:3030
+                              → ClickHouse / Postgres / MinIO
 ```
 
-`answer.maxLength` + array `maxItems` → model pad / infinite list se tokens waste na kare.
-
----
-
-## 6. Langfuse flow (side path — chat block nahi karta)
-
-```
-client.py  (langfuse.openai + @observe)
-    │  async export  →  http://langfuse-web:3000  (Docker network)
-    ▼
-langfuse-web :3000
-    │  enqueue
-    ▼
-Redis :6379
-    │  drain
-    ▼
-langfuse-worker :3030
-    │
-    ├──► ClickHouse :8123 / :9000   traces (prompt, response, tokens, latency)
-    ├──► Postgres   :5433→5432      users / projects / keys
-    └──► MinIO      :9090→9000      blobs / media
-```
-
-| Step | Service | Port | Kya hota hai |
-|------|---------|------|----------------|
-| 1 | backend SDK | — | har LLM call pe trace bhejta hai |
-| 2 | `langfuse-web` | **3000** | receive + UI |
-| 3 | `Redis` | **6379** | queue buffer |
-| 4 | `langfuse-worker` | **3030** | Redis se uthake storage me likhta hai |
-| 5 | ClickHouse / Postgres / MinIO | **8123**, **9000**, **5433**, **9090** | permanent store |
-
-Langfuse down ho to chat ab bhi chalta hai; sirf traces miss ho sakte hain.
+Langfuse down → chat ab bhi chal sakta hai; traces miss ho sakte hain.  
+Langfuse Postgres DB ≠ product chat DB name: product uses DB **`agent_memory`** (same Postgres server).
 
 ---
 
@@ -208,22 +249,39 @@ Langfuse down ho to chat ab bhi chalta hai; sirf traces miss ho sakte hain.
 ```
 rag/
 ├── config/
-│   ├── .env.example           # template → copy to .env
-│   ├── .env                   # vLLM model path, GPU, Langfuse secrets
-│   ├── docker-compose.yml     # vllm-server + backend + Langfuse stack
+│   ├── .env / .env.example
+│   ├── docker-compose.yml      # vLLM, backend, migrates, ES, Neo4j, Langfuse
 │   └── Dockerfile
 │
 ├── backend/
 │   ├── Dockerfile
-│   ├── main.py                # FastAPI app + router only
+│   ├── main.py
 │   ├── requirements.txt
-│   └── vllm/
-│       ├── .env.example       # template → copy to .env
-│       ├── .env               # BASE_URL, MODEL_NAME, Langfuse keys
-│       ├── client.py          # LLM + structured decode + traces
-│       ├── routes.py          # /health, /chat, /chat/structured, /chat/stream
-│       └── schemas.py         # request / response models
+│   ├── vllm/
+│   │   ├── client.py           # structured + stream + grounding filter
+│   │   ├── routes.py
+│   │   ├── schemas.py          # answer + entities/facts/constraints/relations
+│   │   └── .env
+│   └── agent_memory/
+│       ├── .env / .env.example
+│       ├── sql/schema.sql + init_db.sh
+│       ├── elasticsearch/index.json + init_index.sh
+│       ├── knowledge_graph/schema.cypher + store.py
+│       ├── service.py / bridge.py
+│       └── routes.py / schemas.py
 │
-├── chat_client.py             # terminal UI + local fact memory
+├── chat_client.py              # live SSE client
 └── README.md
 ```
+
+---
+
+## 8. Cloud note
+
+Compose migrates = local shortcut. Cloud pe same idea:
+
+1. Infra up (RDS / ES / Neo4j)  
+2. **One-shot migrate job** (schema files from repo)  
+3. Deploy app (no DDL in app)  
+
+Files (`schema.sql`, `index.json`, `schema.cypher`) reuse; runner = CI/K8s Job, not necessarily compose.

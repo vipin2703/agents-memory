@@ -3,3 +3,7 @@ python-dotenv
 fastapi
 uvicorn
 langfuse
+asyncpg
+elasticsearch[async]>=8.0.0,<9.0.0
+aiohttp
+neo4j

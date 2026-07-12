@@ -1,26 +1,23 @@
 """
-vllm_service/client.py -- Local vLLM ke sath saara interaction yahi handle karega.
-Sirf business logic. Koi FastAPI route yaha nahi hoga.
+vllm_service/client.py -- Local vLLM interaction.
 
-LANGFUSE TRACING:
-  - `langfuse.openai` ka AsyncOpenAI drop-in wrapper use kar rahe hain --
-    isse har LLM call (prompt, response, tokens, latency, cost) automatically
-    Langfuse me trace ho jaata hai.
-  - @observe() decorator function-level trace banata hai.
+Single-call structured JSON:
+  - answer (complete, streamed live when using stream path)
+  - extracted_facts (from latest user message only; verified in code)
 
-GUIDED DECODING (single LLM call):
-  - `run_chat_structured()` EK call me answer + extracted_facts deta hai.
-  - Gemma kabhi free-text JSON string ke ANDAR spaces/newlines pad karke
-    max_tokens jala deta hai (disable_any_whitespace string-ke-andar nahi rukta).
-  - Fix: schema me answer.maxLength + facts arrays pe maxItems — xgrammar
-    length hit hote hi string band karwata hai, phir facts complete hote hain.
-
-NOTE: temperature/max_tokens defaults schemas.py (ChatRequest) me hain.
+No answer.maxLength hard cap (that was cutting replies).
+Facts stay bounded with maxItems so JSON can finish.
 """
 
-import os
+from __future__ import annotations
+
 import json
 import logging
+import os
+import re
+from collections.abc import AsyncIterator
+from typing import Any
+
 from langfuse import observe
 from langfuse.openai import AsyncOpenAI
 
@@ -34,30 +31,33 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# -----------------------------------------------------------
-# Local vLLM config
-# -----------------------------------------------------------
 BASE_URL = os.getenv("BASE_URL")
 API_KEY = os.getenv("API_KEY")
 MODEL_NAME = os.getenv("MODEL_NAME")
 
 llm_client = AsyncOpenAI(base_url=BASE_URL, api_key=API_KEY)
 
-STRUCTURED_MIN_MAX_TOKENS = 1024
+# Floor so answer + short facts both fit (client max_tokens se max liya jata hai)
+STRUCTURED_MIN_MAX_TOKENS = 2048
 FACT_ARRAY_MAX_ITEMS = 8
-# answer string ke andar infinite whitespace burn rokne ke liye (chars, not tokens)
-ANSWER_MAX_CHARS = 2500
 
-# Minimal guided schema (no $ref/$defs — xgrammar friendly).
-# answer pehle: user-facing text; maxLength se padding stop.
-# facts baad me: maxItems se array loop stop.
+# answer pe maxLength NAHI — complete answer cut na ho.
+# facts maxItems se JSON finish hota hai; pad risk prompt + disable_any_whitespace se.
+_RELATION_ITEM_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "subject": {"type": "string"},
+        "predicate": {"type": "string"},
+        "object": {"type": "string"},
+    },
+    "required": ["subject", "predicate", "object"],
+    "additionalProperties": False,
+}
+
 GUIDED_JSON_SCHEMA: dict = {
     "type": "object",
     "properties": {
-        "answer": {
-            "type": "string",
-            "maxLength": ANSWER_MAX_CHARS,
-        },
+        "answer": {"type": "string"},
         "extracted_facts": {
             "type": "object",
             "properties": {
@@ -76,8 +76,18 @@ GUIDED_JSON_SCHEMA: dict = {
                     "items": {"type": "string"},
                     "maxItems": FACT_ARRAY_MAX_ITEMS,
                 },
+                "relations": {
+                    "type": "array",
+                    "items": _RELATION_ITEM_SCHEMA,
+                    "maxItems": FACT_ARRAY_MAX_ITEMS,
+                },
             },
-            "required": ["entities", "facts_about_user", "constraints"],
+            "required": [
+                "entities",
+                "facts_about_user",
+                "constraints",
+                "relations",
+            ],
             "additionalProperties": False,
         },
     },
@@ -90,21 +100,27 @@ CHAT_SYSTEM_PROMPT = (
     "Reply in the same language the user used (Hindi/Hinglish/English). "
     "Copy names and company names exactly as the user wrote them — do not misspell. "
     "When MEMORY is provided, treat it as true for this conversation and use it. "
-    "Be concise and natural."
+    "Be clear and complete — do not cut the answer short."
 )
 
 STRUCTURED_SYSTEM_PROMPT = (
     CHAT_SYSTEM_PROMPT
     + " "
-    "You MUST reply with a single JSON object only (no markdown, no extra text). "
-    "Shape: "
-    '{"answer":"<your full reply>","extracted_facts":{"entities":[],"facts_about_user":[],"constraints":[]}}. '
-    "Rules: "
-    "(1) Put the complete reply in answer, then immediately close the string — "
-    "do NOT pad answer with spaces, tabs, or newlines. "
-    f"(2) extracted_facts: only from the latest user message; max {FACT_ARRAY_MAX_ITEMS} "
-    "short items per array; empty arrays if none; no duplicates. "
-    "(3) Finish the entire JSON (close all braces)."
+    "You MUST reply with ONE JSON object only (no markdown, no text outside JSON). "
+    "Keys in order: "
+    '(1) "answer" — your FULL complete reply to the user; finish the whole thought; '
+    "do NOT shorten the answer to make room for facts; "
+    "do NOT pad with spaces/newlines after the last sentence; close the string immediately. "
+    '(2) "extracted_facts" — object with: '
+    "entities, facts_about_user, constraints (string arrays), "
+    "and relations (array of {subject, predicate, object} triples). "
+    f"Max {FACT_ARRAY_MAX_ITEMS} items per array. "
+    "IMPORTANT: BOTH answer and extracted_facts must be present and finished. "
+    "extracted_facts ONLY from the latest user message (not from your answer, not invented). "
+    "relations: how entities connect, e.g. subject=Rahul predicate=LIVES_IN object=Pune; "
+    "predicate UPPER_SNAKE_CASE; only if clearly stated; else relations=[]. "
+    "If nothing to extract, use empty arrays []. "
+    "After answer is complete, fill facts+relations briefly, then close all braces."
 )
 
 
@@ -124,11 +140,21 @@ def _format_memory_block(memory: dict | ExtractedFacts | None) -> str:
         items = data.get(key) or []
         if items:
             lines.append(f"- {key}: {', '.join(str(x) for x in items)}")
+    rels = data.get("relations") or []
+    if rels:
+        bits = []
+        for r in rels:
+            if isinstance(r, dict):
+                bits.append(
+                    f"{r.get('subject', '')} -[{r.get('predicate', '')}]-> {r.get('object', '')}"
+                )
+            else:
+                bits.append(str(r))
+        lines.append("- relations: " + "; ".join(bits))
     if not lines:
         return ""
     return (
-        "MEMORY (facts already known from this conversation — use them; "
-        "do not forget or contradict them):\n"
+        "STRUCTURED FACTS (use them; do not forget or contradict):\n"
         + "\n".join(lines)
     )
 
@@ -138,13 +164,17 @@ def _with_system_and_memory(
     memory: dict | ExtractedFacts | None = None,
     *,
     system_prompt: str = CHAT_SYSTEM_PROMPT,
+    extra_memory_block: str | None = None,
 ) -> list[dict]:
-    """System prompt + optional persistent memory inject."""
-    memory_block = _format_memory_block(memory)
-    system_content = system_prompt
-    if memory_block:
-        system_content = f"{system_prompt}\n\n{memory_block}"
+    parts = [system_prompt]
+    rich = (extra_memory_block or "").strip()
+    if rich:
+        parts.append(rich)
+    fact_block = _format_memory_block(memory)
+    if fact_block:
+        parts.append(fact_block)
 
+    system_content = "\n\n".join(parts)
     rest = [m for m in messages if m.get("role") != "system"]
     return [{"role": "system", "content": system_content}, *rest]
 
@@ -166,27 +196,106 @@ def _dedupe_list(items: list, *, max_items: int = FACT_ARRAY_MAX_ITEMS) -> list[
     return out
 
 
-def _normalize_structured_dict(data: dict) -> dict:
+def _item_grounded_in_user(item: str, user_lower: str) -> bool:
+    """Cheap anti-hallucination: fact must appear in / overlap user text."""
+    s = (item or "").strip()
+    if not s:
+        return False
+    sl = s.lower()
+    if sl in user_lower:
+        return True
+    words = [w for w in re.findall(r"\w+", sl, flags=re.UNICODE) if len(w) > 2]
+    if not words:
+        return sl in user_lower
+    hits = sum(1 for w in words if w in user_lower)
+    return hits >= max(1, (len(words) + 1) // 2)
+
+
+def _normalize_predicate(pred: str) -> str:
+    p = re.sub(r"[^A-Za-z0-9]+", "_", (pred or "").strip()).strip("_")
+    return (p or "RELATED_TO").upper()[:64]
+
+
+def _normalize_relations(raw_rels: list, *, max_items: int = FACT_ARRAY_MAX_ITEMS) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for r in raw_rels or []:
+        if isinstance(r, dict):
+            sub = str(r.get("subject") or "").strip()
+            pred = _normalize_predicate(str(r.get("predicate") or ""))
+            obj = str(r.get("object") or "").strip()
+        else:
+            continue
+        if not sub or not obj:
+            continue
+        key = f"{sub.lower()}|{pred}|{obj.lower()}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"subject": sub, "predicate": pred, "object": obj})
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def filter_facts_against_user_text(facts: dict, user_text: str) -> dict:
+    """Drop ungrounded extracts (no extra LLM cost)."""
+    user_lower = (user_text or "").lower()
+    empty = {
+        "entities": [],
+        "facts_about_user": [],
+        "constraints": [],
+        "relations": [],
+    }
+    if not user_lower.strip():
+        return empty
+    out: dict = {}
+    for key in ("entities", "facts_about_user", "constraints"):
+        kept: list[str] = []
+        for item in facts.get(key) or []:
+            if _item_grounded_in_user(str(item), user_lower):
+                kept.append(str(item).strip())
+        out[key] = _dedupe_list(kept)
+    rels_kept: list[dict] = []
+    for r in facts.get("relations") or []:
+        if not isinstance(r, dict):
+            continue
+        sub = str(r.get("subject") or "").strip()
+        obj = str(r.get("object") or "").strip()
+        pred = _normalize_predicate(str(r.get("predicate") or ""))
+        # subject + object dono user text me grounded
+        if _item_grounded_in_user(sub, user_lower) and _item_grounded_in_user(
+            obj, user_lower
+        ):
+            rels_kept.append({"subject": sub, "predicate": pred, "object": obj})
+    out["relations"] = _normalize_relations(rels_kept)
+    return out
+
+
+def _normalize_structured_dict(
+    data: dict, *, user_text: str | None = None
+) -> dict:
     answer = data.get("answer")
     if answer is None:
         answer = ""
     elif not isinstance(answer, str):
         answer = str(answer)
-    # model trailing pad ho to clean
     answer = answer.strip()
 
     facts_raw = data.get("extracted_facts") or {}
     if not isinstance(facts_raw, dict):
         facts_raw = {}
 
-    return {
-        "answer": answer,
-        "extracted_facts": {
-            "entities": _dedupe_list(facts_raw.get("entities") or []),
-            "facts_about_user": _dedupe_list(facts_raw.get("facts_about_user") or []),
-            "constraints": _dedupe_list(facts_raw.get("constraints") or []),
-        },
+    facts = {
+        "entities": _dedupe_list(facts_raw.get("entities") or []),
+        "facts_about_user": _dedupe_list(facts_raw.get("facts_about_user") or []),
+        "constraints": _dedupe_list(facts_raw.get("constraints") or []),
+        "relations": _normalize_relations(facts_raw.get("relations") or []),
     }
+    if user_text is not None:
+        facts = filter_facts_against_user_text(facts, user_text)
+
+    return {"answer": answer, "extracted_facts": facts}
 
 
 def _extract_answer_from_broken_json(text: str) -> str:
@@ -219,8 +328,53 @@ def _extract_answer_from_broken_json(text: str) -> str:
         return "".join(chars).strip()
 
 
+def partial_answer_from_raw_json(raw: str) -> str:
+    """Live stream: partial/complete answer string from incomplete JSON buffer."""
+    m = re.search(r'"answer"\s*:\s*"', raw)
+    if not m:
+        return ""
+    i = m.end()
+    out: list[str] = []
+    escape = False
+    while i < len(raw):
+        c = raw[i]
+        if escape:
+            if c == "n":
+                out.append("\n")
+            elif c == "t":
+                out.append("\t")
+            elif c == "r":
+                out.append("\r")
+            elif c == '"':
+                out.append('"')
+            elif c == "\\":
+                out.append("\\")
+            elif c == "/":
+                out.append("/")
+            elif c == "u" and i + 4 < len(raw):
+                hexpart = raw[i + 1 : i + 5]
+                try:
+                    out.append(chr(int(hexpart, 16)))
+                    i += 4
+                except ValueError:
+                    out.append(c)
+            else:
+                out.append(c)
+            escape = False
+            i += 1
+            continue
+        if c == "\\":
+            escape = True
+            i += 1
+            continue
+        if c == '"':
+            break
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _try_repair_truncated_json(text: str) -> dict | None:
-    """Safety net agar finish_reason=length mid-JSON cut kare."""
     answer = _extract_answer_from_broken_json(text)
 
     candidate = text.rstrip()
@@ -258,7 +412,10 @@ def _try_repair_truncated_json(text: str) -> dict | None:
                         "entities": [],
                         "facts_about_user": [],
                         "constraints": [],
+                        "relations": [],
                     }
+                else:
+                    data["extracted_facts"].setdefault("relations", [])
                 return data
         except json.JSONDecodeError:
             pass
@@ -270,13 +427,18 @@ def _try_repair_truncated_json(text: str) -> dict | None:
                 "entities": [],
                 "facts_about_user": [],
                 "constraints": [],
+                "relations": [],
             },
         }
     return None
 
 
 def _parse_structured_output(
-    raw: str, finish_reason: str | None, max_tokens: int
+    raw: str,
+    finish_reason: str | None,
+    max_tokens: int,
+    *,
+    user_text: str | None = None,
 ) -> StructuredChatOutput:
     text = (raw or "").strip()
     if not text:
@@ -321,7 +483,53 @@ def _parse_structured_output(
             ) from e
 
     assert data is not None
-    return StructuredChatOutput(**_normalize_structured_dict(data))
+    return StructuredChatOutput(
+        **_normalize_structured_dict(data, user_text=user_text)
+    )
+
+
+def _latest_user_text(messages: list[dict]) -> str:
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            return (m.get("content") or "").strip()
+    return ""
+
+
+def _structured_request_kwargs(
+    final_messages: list[dict],
+    *,
+    temperature: float,
+    max_tokens: int,
+    stream: bool = False,
+) -> dict[str, Any]:
+    structured_temperature = min(temperature, 0.5)
+    structured_max_tokens = max(max_tokens, STRUCTURED_MIN_MAX_TOKENS)
+    kwargs: dict[str, Any] = {
+        "model": MODEL_NAME,
+        "messages": final_messages,
+        "temperature": structured_temperature,
+        "max_tokens": structured_max_tokens,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "structured_chat_output",
+                "schema": GUIDED_JSON_SCHEMA,
+                "strict": True,
+            },
+        },
+        "extra_body": {
+            "structured_outputs": {
+                "json": GUIDED_JSON_SCHEMA,
+                "disable_any_whitespace": True,
+                "disable_additional_properties": True,
+                "whitespace_pattern": "",
+            },
+        },
+    }
+    if stream:
+        kwargs["stream"] = True
+        kwargs["stream_options"] = {"include_usage": True}
+    return kwargs
 
 
 @observe()
@@ -330,10 +538,13 @@ async def run_chat(
     temperature: float,
     max_tokens: int,
     memory: dict | ExtractedFacts | None = None,
+    extra_memory_block: str | None = None,
 ) -> str:
-    """Non-streaming plain text chat (no structured decoding)."""
     final_messages = _with_system_and_memory(
-        messages, memory=memory, system_prompt=CHAT_SYSTEM_PROMPT
+        messages,
+        memory=memory,
+        system_prompt=CHAT_SYSTEM_PROMPT,
+        extra_memory_block=extra_memory_block,
     )
 
     completion = await llm_client.chat.completions.create(
@@ -352,60 +563,29 @@ async def run_chat_structured(
     temperature: float,
     max_tokens: int,
     memory: dict | ExtractedFacts | None = None,
+    extra_memory_block: str | None = None,
 ) -> StructuredChatOutput:
-    """
-    EK HI LLM call + vLLM guided JSON.
-
-    Output:
-      {
-        "answer": "...",                 # maxLength capped in grammar
-        "extracted_facts": {
-          "entities": [...],             # maxItems 8
-          "facts_about_user": [...],
-          "constraints": [...]
-        }
-      }
-    """
-    structured_temperature = min(temperature, 0.5)
-    structured_max_tokens = max(max_tokens, STRUCTURED_MIN_MAX_TOKENS)
-
+    """Single LLM call: complete answer + extracted_facts (user-grounded filter)."""
     final_messages = _with_system_and_memory(
         messages,
         memory=memory,
         system_prompt=STRUCTURED_SYSTEM_PROMPT,
+        extra_memory_block=extra_memory_block,
     )
-    print("strucure")
-    print(final_messages)
-    print("endstructure")
+    kwargs = _structured_request_kwargs(
+        final_messages, temperature=temperature, max_tokens=max_tokens, stream=False
+    )
+    structured_max_tokens = kwargs["max_tokens"]
 
-    completion = await llm_client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=final_messages,
-        temperature=structured_temperature,
-        max_tokens=structured_max_tokens,
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "structured_chat_output",
-                "schema": GUIDED_JSON_SCHEMA,
-                "strict": True,
-            },
-        },
-        extra_body={
-            "structured_outputs": {
-                "json": GUIDED_JSON_SCHEMA,
-                "disable_any_whitespace": True,
-                "disable_additional_properties": True,
-                "whitespace_pattern": "",
-            },
-        },
-    )
-    print(completion)
+    completion = await llm_client.chat.completions.create(**kwargs)
     choice = completion.choices[0]
     raw = choice.message.content or ""
     finish_reason = choice.finish_reason
+    user_text = _latest_user_text(messages)
 
-    result = _parse_structured_output(raw, finish_reason, structured_max_tokens)
+    result = _parse_structured_output(
+        raw, finish_reason, structured_max_tokens, user_text=user_text
+    )
     if finish_reason == "length":
         logger.warning(
             "Structured hit max_tokens=%s; answer_len=%s facts=%s",
@@ -417,10 +597,91 @@ async def run_chat_structured(
 
 
 @observe()
-async def run_chat_stream(messages: list[dict], temperature: float, max_tokens: int):
+async def run_chat_structured_stream(
+    messages: list[dict],
+    temperature: float,
+    max_tokens: int,
+    memory: dict | ExtractedFacts | None = None,
+    extra_memory_block: str | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """
+    Single structured call with LIVE answer tokens.
+
+    Yields:
+      {"type": "answer_delta", "text": "..."}
+      {"type": "final", "answer": "...", "extracted_facts": {...}, "finish_reason": "..."}
+      {"type": "error", "message": "..."}
+    """
+    final_messages = _with_system_and_memory(
+        messages,
+        memory=memory,
+        system_prompt=STRUCTURED_SYSTEM_PROMPT,
+        extra_memory_block=extra_memory_block,
+    )
+    kwargs = _structured_request_kwargs(
+        final_messages, temperature=temperature, max_tokens=max_tokens, stream=True
+    )
+    structured_max_tokens = kwargs["max_tokens"]
+    user_text = _latest_user_text(messages)
+
+    raw_parts: list[str] = []
+    emitted_answer_len = 0
+    finish_reason: str | None = None
+
+    try:
+        stream = await llm_client.chat.completions.create(**kwargs)
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+            delta = choice.delta.content if choice.delta else None
+            if not delta:
+                continue
+            raw_parts.append(delta)
+            raw_so_far = "".join(raw_parts)
+            partial = partial_answer_from_raw_json(raw_so_far)
+            if len(partial) > emitted_answer_len:
+                new_text = partial[emitted_answer_len:]
+                emitted_answer_len = len(partial)
+                yield {"type": "answer_delta", "text": new_text}
+
+        raw = "".join(raw_parts)
+        result = _parse_structured_output(
+            raw, finish_reason, structured_max_tokens, user_text=user_text
+        )
+        # agar stream me answer incomplete tha, final se catch-up
+        if len(result.answer) > emitted_answer_len:
+            yield {
+                "type": "answer_delta",
+                "text": result.answer[emitted_answer_len:],
+            }
+        yield {
+            "type": "final",
+            "answer": result.answer,
+            "extracted_facts": result.extracted_facts.model_dump(),
+            "finish_reason": finish_reason,
+        }
+    except Exception as e:
+        logger.exception("structured stream failed")
+        yield {"type": "error", "message": str(e)}
+
+
+@observe()
+async def run_chat_stream(
+    messages: list[dict],
+    temperature: float,
+    max_tokens: int,
+    memory: dict | ExtractedFacts | None = None,
+    extra_memory_block: str | None = None,
+):
     """Streaming plain text (no guided JSON)."""
     final_messages = _with_system_and_memory(
-        messages, memory=None, system_prompt=CHAT_SYSTEM_PROMPT
+        messages,
+        memory=memory,
+        system_prompt=CHAT_SYSTEM_PROMPT,
+        extra_memory_block=extra_memory_block,
     )
     try:
         stream = await llm_client.chat.completions.create(

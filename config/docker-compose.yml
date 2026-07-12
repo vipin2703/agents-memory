@@ -157,6 +157,115 @@ services:
 
 
   # -----------------------------------------------------------
+  # AGENT MEMORY stores — SQL (postgres) + Elasticsearch + Neo4j
+  # -----------------------------------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: agent_memory_elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - cluster.name=agent-memory
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9200:9200"
+    volumes:
+      - agent_memory_elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200 >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+
+  neo4j:
+    image: neo4j:5.26
+    container_name: agent_memory_neo4j
+    environment:
+      - NEO4J_AUTH=${MEMORY_NEO4J_USER:-neo4j}/${MEMORY_NEO4J_PASSWORD:-agentmemory}
+      - NEO4J_server_memory_heap_initial__size=256m
+      - NEO4J_server_memory_heap_max__size=512m
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - agent_memory_neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p agentmemory 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+
+  # -----------------------------------------------------------
+  # AGENT MEMORY schema migrates — NOT in app code
+  #   memory-migrate         → Postgres DB + tables
+  #   elasticsearch-migrate  → ES index (BM25 + dense_vector)
+  #   neo4j-migrate          → Neo4j constraints (knowledge graph)
+  # -----------------------------------------------------------
+  memory-migrate:
+    image: docker.io/postgres:${POSTGRES_VERSION:-17}
+    container_name: agent_memory_migrate
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      MEMORY_DB_NAME: agent_memory
+      PGHOST: postgres
+      PGPORT: "5432"
+      SCHEMA_FILE: /schema.sql
+    volumes:
+      - ../backend/agent_memory/sql/schema.sql:/schema.sql:ro
+      - ../backend/agent_memory/sql/init_db.sh:/init_db.sh:ro
+    entrypoint: ["/bin/bash", "/init_db.sh"]
+
+  elasticsearch-migrate:
+    image: curlimages/curl:8.5.0
+    container_name: agent_memory_elasticsearch_migrate
+    restart: "no"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      MEMORY_ELASTICSEARCH_URL: http://elasticsearch:9200
+      MEMORY_ELASTICSEARCH_INDEX: agent_memory_messages
+      SCHEMA_FILE: /index.json
+    volumes:
+      - ../backend/agent_memory/elasticsearch/index.json:/index.json:ro
+      - ../backend/agent_memory/elasticsearch/init_index.sh:/init_index.sh:ro
+    entrypoint: ["/bin/sh", "/init_index.sh"]
+
+  neo4j-migrate:
+    image: neo4j:5.26
+    container_name: agent_memory_neo4j_migrate
+    restart: "no"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    environment:
+      MEMORY_NEO4J_USER: ${MEMORY_NEO4J_USER:-neo4j}
+      MEMORY_NEO4J_PASSWORD: ${MEMORY_NEO4J_PASSWORD:-agentmemory}
+      NEO4J_HOST: neo4j
+      NEO4J_BOLT_PORT: "7687"
+      SCHEMA_FILE: /schema.cypher
+    volumes:
+      - ../backend/agent_memory/knowledge_graph/schema.cypher:/schema.cypher:ro
+      - ../backend/agent_memory/knowledge_graph/init_graph.sh:/init_graph.sh:ro
+    entrypoint: ["/bin/bash", "/init_graph.sh"]
+
+  # -----------------------------------------------------------
   # CLIENT (backend) -- vLLM server ko HTTP se call karta h
   # -----------------------------------------------------------
   client:
@@ -170,9 +279,19 @@ services:
       - ../backend:/app
     container_name: llm_serve
     depends_on:
-      - vllm-server
+      vllm-server:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      memory-migrate:
+        condition: service_completed_successfully
+      elasticsearch-migrate:
+        condition: service_completed_successfully
+      neo4j-migrate:
+        condition: service_completed_successfully
     env_file:
       - ../backend/vllm/.env
+      - ../backend/agent_memory/.env
 
   # =============================================================
   # LANGFUSE STACK (self-hosted, v3) -- LLM observability/tracing
@@ -332,4 +451,8 @@ volumes:
   langfuse_minio_data:
     driver: local
   langfuse_redis_data:
+    driver: local
+  agent_memory_elasticsearch_data:
+    driver: local
+  agent_memory_neo4j_data:
     driver: local
