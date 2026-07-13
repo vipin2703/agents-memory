@@ -167,61 +167,95 @@ class GraphStore:
                 )
 
     async def facts_for_user(self, user_id: str, limit: int = 30) -> list[dict[str, Any]]:
+        """
+        Generic MATCH use karte hain taaki empty DB pe
+        'relationship type does not exist' warnings na aayein.
+        (Neo4j warns jab pattern me :RELATES_TO / :HAS_CONSTRAINT etc.
+         pehli baar kabhi create na hue hon.)
+        """
         await self.connect()
         assert self._driver
         out: list[dict[str, Any]] = []
         async with self._driver.session() as session:
+            # User se nikalte saare edges — type/label se classify
             rec = await session.run(
                 """
-                MATCH (u:User {id: $user_id})-[:MENTIONED]->(e:Entity)
-                RETURN 'entity' AS kind, e.name AS text
+                MATCH (u:User {id: $user_id})-[r]->(n)
+                RETURN type(r) AS rel_type, labels(n) AS labels,
+                       n.name AS name, n.text AS text
+                LIMIT $limit
+                """,
+                user_id=user_id,
+                limit=max(limit * 3, 30),
+            )
+            async for row in rec:
+                rel_type = row["rel_type"] or ""
+                labels = list(row["labels"] or [])
+                name = row["name"]
+                text = row["text"]
+                if rel_type == "MENTIONED" or "Entity" in labels:
+                    if name:
+                        out.append(
+                            {"kind": "entity", "text": name, "user_id": user_id}
+                        )
+                elif rel_type == "HAS_FACT" or "UserFact" in labels:
+                    if text:
+                        out.append(
+                            {
+                                "kind": "fact_about_user",
+                                "text": text,
+                                "user_id": user_id,
+                            }
+                        )
+                elif rel_type == "HAS_CONSTRAINT" or "Constraint" in labels:
+                    if text:
+                        out.append(
+                            {
+                                "kind": "constraint",
+                                "text": text,
+                                "user_id": user_id,
+                            }
+                        )
+
+            # Entity ↔ Entity relations (bina :RELATES_TO hard pattern ke)
+            rec = await session.run(
+                """
+                MATCH (s:Entity {user_id: $user_id})-[r]->(o:Entity {user_id: $user_id})
+                WHERE type(r) = 'RELATES_TO'
+                   OR r.predicate IS NOT NULL
+                RETURN s.name AS subject,
+                       coalesce(r.predicate, type(r)) AS predicate,
+                       o.name AS object
                 LIMIT $limit
                 """,
                 user_id=user_id,
                 limit=limit,
             )
             async for row in rec:
-                out.append({"kind": row["kind"], "text": row["text"], "user_id": user_id})
+                sub = row["subject"] or ""
+                pred = row["predicate"] or "RELATED_TO"
+                obj = row["object"] or ""
+                if sub and obj:
+                    out.append(
+                        {
+                            "kind": "relation",
+                            "text": f"{sub} -[{pred}]-> {obj}",
+                            "user_id": user_id,
+                        }
+                    )
 
-            rec = await session.run(
-                """
-                MATCH (u:User {id: $user_id})-[:HAS_FACT]->(f:UserFact)
-                RETURN 'fact_about_user' AS kind, f.text AS text
-                LIMIT $limit
-                """,
-                user_id=user_id,
-                limit=limit,
-            )
-            async for row in rec:
-                out.append({"kind": row["kind"], "text": row["text"], "user_id": user_id})
-
-            rec = await session.run(
-                """
-                MATCH (u:User {id: $user_id})-[:HAS_CONSTRAINT]->(c:Constraint)
-                RETURN 'constraint' AS kind, c.text AS text
-                LIMIT $limit
-                """,
-                user_id=user_id,
-                limit=limit,
-            )
-            async for row in rec:
-                out.append({"kind": row["kind"], "text": row["text"], "user_id": user_id})
-
-            # relations between entities for this user
-            rec = await session.run(
-                """
-                MATCH (s:Entity {user_id: $user_id})-[r:RELATES_TO {user_id: $user_id}]->(o:Entity {user_id: $user_id})
-                RETURN 'relation' AS kind,
-                       s.name + ' -[' + r.predicate + ']-> ' + o.name AS text
-                LIMIT $limit
-                """,
-                user_id=user_id,
-                limit=limit,
-            )
-            async for row in rec:
-                out.append({"kind": row["kind"], "text": row["text"], "user_id": user_id})
-
-        return out[: limit * 2]  # entities + relations mix; trim soft
+        # dedupe by kind+text
+        seen: set[str] = set()
+        deduped: list[dict[str, Any]] = []
+        for item in out:
+            key = f"{item['kind']}|{item['text']}".lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+            if len(deduped) >= limit * 2:
+                break
+        return deduped
 
     async def clear_user(self, user_id: str) -> None:
         await self.connect()

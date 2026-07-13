@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import sys
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -166,6 +167,12 @@ def _with_system_and_memory(
     system_prompt: str = CHAT_SYSTEM_PROMPT,
     extra_memory_block: str | None = None,
 ) -> list[dict]:
+    """
+    final_messages banata hai (vLLM ko yahi jati hai).
+
+    File: backend/vllm/client.py
+    Variable: final_messages
+    """
     parts = [system_prompt]
     rich = (extra_memory_block or "").strip()
     if rich:
@@ -176,7 +183,35 @@ def _with_system_and_memory(
 
     system_content = "\n\n".join(parts)
     rest = [m for m in messages if m.get("role") != "system"]
-    return [{"role": "system", "content": system_content}, *rest]
+    final_messages = [{"role": "system", "content": system_content}, *rest]
+    return final_messages
+
+
+def _debug_print_final_messages(final_messages: list[dict], where: str) -> None:
+    """Simple debug — vLLM call se pehle. Variable name = final_messages."""
+    print("\n========== FINAL vLLM INPUT ==========", flush=True)
+    print("file: backend/vllm/client.py", flush=True)
+    print(f"where: {where}", flush=True)
+    print("variable: final_messages", flush=True)
+    print(f"count: {len(final_messages)}", flush=True)
+    print(json.dumps(final_messages, indent=2, ensure_ascii=False), flush=True)
+    print("========== END FINAL vLLM INPUT ==========\n", flush=True)
+    sys.stdout.flush()
+
+
+def _debug_print_final_output(payload: dict | str, where: str, *, variable: str = "result") -> None:
+    """Simple debug — vLLM se aane ke baad. Variable name default = result."""
+    print("\n========== FINAL vLLM OUTPUT ==========", flush=True)
+    print("file: backend/vllm/client.py", flush=True)
+    print(f"where: {where}", flush=True)
+    print(f"variable: {variable}", flush=True)
+    if isinstance(payload, str):
+        print(f"len: {len(payload)}", flush=True)
+        print(payload, flush=True)
+    else:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str), flush=True)
+    print("========== END FINAL vLLM OUTPUT ==========\n", flush=True)
+    sys.stdout.flush()
 
 
 def _dedupe_list(items: list, *, max_items: int = FACT_ARRAY_MAX_ITEMS) -> list[str]:
@@ -546,6 +581,7 @@ async def run_chat(
         system_prompt=CHAT_SYSTEM_PROMPT,
         extra_memory_block=extra_memory_block,
     )
+    _debug_print_final_messages(final_messages, "run_chat → create")
 
     completion = await llm_client.chat.completions.create(
         model=MODEL_NAME,
@@ -554,7 +590,16 @@ async def run_chat(
         max_tokens=max_tokens,
     )
     content = completion.choices[0].message.content
-    return (content or "").strip()
+    text = (content or "").strip()
+    _debug_print_final_output(
+        {
+            "content": text,
+            "finish_reason": completion.choices[0].finish_reason,
+        },
+        "run_chat ← response",
+        variable="content",
+    )
+    return text
 
 
 @observe()
@@ -572,6 +617,7 @@ async def run_chat_structured(
         system_prompt=STRUCTURED_SYSTEM_PROMPT,
         extra_memory_block=extra_memory_block,
     )
+    _debug_print_final_messages(final_messages, "run_chat_structured → create")
     kwargs = _structured_request_kwargs(
         final_messages, temperature=temperature, max_tokens=max_tokens, stream=False
     )
@@ -583,8 +629,26 @@ async def run_chat_structured(
     finish_reason = choice.finish_reason
     user_text = _latest_user_text(messages)
 
+    _debug_print_final_output(
+        {
+            "raw_content": raw,
+            "finish_reason": finish_reason,
+        },
+        "run_chat_structured ← raw model content",
+        variable="raw",
+    )
+
     result = _parse_structured_output(
         raw, finish_reason, structured_max_tokens, user_text=user_text
+    )
+    _debug_print_final_output(
+        {
+            "answer": result.answer,
+            "extracted_facts": result.extracted_facts.model_dump(),
+            "finish_reason": finish_reason,
+        },
+        "run_chat_structured ← parsed result",
+        variable="result",
     )
     if finish_reason == "length":
         logger.warning(
@@ -618,6 +682,8 @@ async def run_chat_structured_stream(
         system_prompt=STRUCTURED_SYSTEM_PROMPT,
         extra_memory_block=extra_memory_block,
     )
+    
+    _debug_print_final_messages(final_messages, "run_chat_structured_stream → create")
     kwargs = _structured_request_kwargs(
         final_messages, temperature=temperature, max_tokens=max_tokens, stream=True
     )
@@ -648,8 +714,25 @@ async def run_chat_structured_stream(
                 yield {"type": "answer_delta", "text": new_text}
 
         raw = "".join(raw_parts)
+        _debug_print_final_output(
+            {
+                "raw_content": raw,
+                "finish_reason": finish_reason,
+            },
+            "run_chat_structured_stream ← raw model content",
+            variable="raw",
+        )
         result = _parse_structured_output(
             raw, finish_reason, structured_max_tokens, user_text=user_text
+        )
+        _debug_print_final_output(
+            {
+                "answer": result.answer,
+                "extracted_facts": result.extracted_facts.model_dump(),
+                "finish_reason": finish_reason,
+            },
+            "run_chat_structured_stream ← parsed result",
+            variable="result",
         )
         # agar stream me answer incomplete tha, final se catch-up
         if len(result.answer) > emitted_answer_len:
@@ -683,6 +766,7 @@ async def run_chat_stream(
         system_prompt=CHAT_SYSTEM_PROMPT,
         extra_memory_block=extra_memory_block,
     )
+    _debug_print_final_messages(final_messages, "run_chat_stream → create")
     try:
         stream = await llm_client.chat.completions.create(
             model=MODEL_NAME,
@@ -692,11 +776,19 @@ async def run_chat_stream(
             stream=True,
             stream_options={"include_usage": True},
         )
+        parts: list[str] = []
         async for chunk in stream:
             if chunk.choices:
                 delta = chunk.choices[0].delta.content
                 if delta:
+                    parts.append(delta)
                     yield f"data: {delta}\n\n"
+        full = "".join(parts)
+        _debug_print_final_output(
+            {"content": full},
+            "run_chat_stream ← full text",
+            variable="full",
+        )
         yield "data: [DONE]\n\n"
     except Exception as e:
         yield f"data: [ERROR] {e}\n\n"

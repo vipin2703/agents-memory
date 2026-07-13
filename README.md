@@ -37,6 +37,8 @@ Local Docker stack: **chat client → FastAPI backend → vLLM (GPU)** with **ag
 | `postgres` | **5433**→5432 | Langfuse meta + DB `agent_memory` (chat truth) |
 | `elasticsearch` | **9200** | Full-text + dense_vector field |
 | `neo4j` | **7474** / **7687** | Knowledge graph |
+| `graphxr` | **8080** | **3D GraphXR** UI (Neo4j pe) |
+| `graphxr-mongo` | — | GraphXR metadata store |
 | `memory-migrate` | one-shot | SQL schema |
 | `elasticsearch-migrate` | one-shot | ES index |
 | `neo4j-migrate` | one-shot | Neo4j constraints |
@@ -92,7 +94,33 @@ Local Docker stack: **chat client → FastAPI backend → vLLM (GPU)** with **ag
 | http://localhost:9200 | Elasticsearch |
 | http://localhost:7474 | Neo4j Browser |
 | bolt://localhost:7687 | Neo4j Bolt |
+| **http://localhost:8080** | **GraphXR 3D** (login below) |
 | http://localhost:5000/memory/health | Memory health |
+
+### GraphXR 3D (Neo4j)
+
+Agent memory graph ko 3D me dekhne ke liye [GraphXR Lite](https://github.com/Kineviz/graphxr-lite) stack compose me hai.
+
+```powershell
+cd config
+docker compose up -d neo4j graphxr-mongo graphxr
+# pehli baar image pull bada ho sakta hai (linux/amd64)
+```
+
+| | |
+|--|--|
+| URL | http://localhost:8080 |
+| Login | `config/.env` → `GRAPHXR_ADMIN_EMAIL` / `GRAPHXR_ADMIN_PASSWORD` |
+| Neo4j (auto) | `config/.env` → `MEMORY_NEO4J_USER` / `MEMORY_NEO4J_PASSWORD` |
+
+Passwords **compose.yml me hardcode nahi** — sirf `config/.env` (template: `config/.env.example`).  
+Backend app Neo4j client: `backend/agent_memory/.env` (`MEMORY_NEO4J_URI` + same user/pass).
+
+1. Chat se kuch entities/relations save karo (`python chat_client.py`)  
+2. GraphXR kholo → project / Neo4j connection (defaults pehle se env se set)  
+3. Query e.g. `MATCH (n)-[r]->(m) RETURN n,r,m LIMIT 200` ya UI se load → **3D** explore  
+
+Neo4j Browser 2D: http://localhost:7474 (same credentials).
 
 Schema dubara apply (safe re-run):
 ```powershell
@@ -250,7 +278,7 @@ Langfuse Postgres DB ≠ product chat DB name: product uses DB **`agent_memory`*
 rag/
 ├── config/
 │   ├── .env / .env.example
-│   ├── docker-compose.yml      # vLLM, backend, migrates, ES, Neo4j, Langfuse
+│   ├── docker-compose.yml      # vLLM, backend, ES, Neo4j, GraphXR, Langfuse
 │   └── Dockerfile
 │
 ├── backend/
