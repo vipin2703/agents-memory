@@ -63,28 +63,16 @@ Docker Compose **`config/`** se chalta hai → variable substitution + `env_file
 | **`backend/vllm/.env`** | `BASE_URL`, `MODEL_NAME`, Langfuse API keys (backend → vLLM / Langfuse) |
 | **`backend/agent_memory/.env`** | Backend app → stores: `MEMORY_DATABASE_URL`, ES URL, **Neo4j URI + same user/pass** |
 
-### `config/.env` — Neo4j + GraphXR (compose services)
+### Key vars (values **README me nahi** — apne `.env` me rakho)
 
-```env
-# Neo4j (service neo4j, neo4j-migrate, graphxr)
-MEMORY_NEO4J_USER=neo4j
-MEMORY_NEO4J_PASSWORD=agentmemory
+| Where | Variables (names only) |
+|-------|------------------------|
+| `config/.env` | `MEMORY_NEO4J_USER`, `MEMORY_NEO4J_PASSWORD`, `GRAPHXR_ADMIN_EMAIL`, `GRAPHXR_ADMIN_PASSWORD`, Postgres, model path, Langfuse stack |
+| `backend/agent_memory/.env` | `MEMORY_DATABASE_URL`, `MEMORY_ELASTICSEARCH_*`, `MEMORY_NEO4J_URI`, `MEMORY_NEO4J_USER`, `MEMORY_NEO4J_PASSWORD` |
+| `backend/vllm/.env` | `BASE_URL`, `MODEL_NAME`, `LANGFUSE_*` |
 
-# GraphXR Lite UI http://localhost:8080
-GRAPHXR_ADMIN_EMAIL=graphxr@local.dev
-GRAPHXR_ADMIN_PASSWORD=graphxr123456
-```
-
-### `backend/agent_memory/.env` — Python Neo4j client (same credentials)
-
-```env
-MEMORY_NEO4J_URI=bolt://neo4j:7687
-MEMORY_NEO4J_USER=neo4j
-MEMORY_NEO4J_PASSWORD=agentmemory
-```
-
-**Rule:** passwords / IDs **`docker-compose.yml` me mat likho** — sirf `.env` files.  
-Compose sirf `${MEMORY_NEO4J_USER}`, `${GRAPHXR_ADMIN_PASSWORD}`, … expand karta hai.
+Templates: `*.env.example` — wahan se copy karke **apni** values bharo.  
+**Rule:** passwords / emails / secrets **kabhi README ya compose me mat commit karo** — sirf `.env` (gitignored ideally).
 
 ---
 
@@ -166,17 +154,17 @@ docker compose up -d neo4j graphxr-mongo graphxr
 | Item | Value |
 |------|--------|
 | UI | http://localhost:8080 |
-| Login | `config/.env` → `GRAPHXR_ADMIN_EMAIL` / `GRAPHXR_ADMIN_PASSWORD` |
-| Neo4j link | compose env: host `neo4j`, user/pass from `MEMORY_NEO4J_*` |
+| Login | values from `config/.env` (`GRAPHXR_ADMIN_*`) — not listed here |
+| Neo4j | service host `neo4j`; auth from `config/.env` (`MEMORY_NEO4J_*`) |
 
-**Mongo (`graphxr-mongo`)** = sirf GraphXR app meta (projects/UI). **Product graph data Neo4j me hai**, Mongo me nahi.
+**Mongo (`graphxr-mongo`)** = sirf GraphXR app meta. **Product graph = Neo4j only.**
 
 Flow:
-1. Chat se entities/relations save (`python chat_client.py`)  
-2. http://localhost:8080 → login (`.env` credentials)  
-3. Graph load / Cypher → 3D explore  
+1. Chat se entities/relations save  
+2. GraphXR UI → login with your `.env` values  
+3. Load graph → 3D explore  
 
-2D: http://localhost:7474 (same `MEMORY_NEO4J_*`).
+2D: http://localhost:7474 (same Neo4j credentials from `.env`).
 
 ---
 
