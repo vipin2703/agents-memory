@@ -143,9 +143,15 @@ class AgentMemoryService:
         graph_limit: int = 30,
         include_recent_in_block: bool = True,
     ) -> MemoryRecallResponse:
+        """
+        Query the stores — do not dump the whole graph.
+        ES: BM25 on messages. Neo4j: CONTAINS search on entities/facts/relations.
+        No hits → empty memory_block (caller injects nothing).
+        """
         recent_raw: list[dict] = []
         search_raw: list[dict] = []
         graph_raw: list[dict] = []
+        q = (query or "").strip()
 
         try:
             recent_raw = await self.sql.recent_messages(
@@ -154,21 +160,27 @@ class AgentMemoryService:
         except Exception as e:
             logger.warning("recall sql: %s", e)
 
-        if query and query.strip():
+        if q:
             try:
                 search_raw = await self.search.search(
                     user_id=user_id,
-                    query=query.strip(),
+                    query=q,
                     session_id=None,
                     limit=search_limit,
                 )
             except Exception as e:
                 logger.warning("recall elasticsearch: %s", e)
 
-        try:
-            graph_raw = await self.graph.facts_for_user(user_id, limit=graph_limit)
-        except Exception as e:
-            logger.warning("recall knowledge_graph: %s", e)
+            try:
+                graph_raw = await self.graph.search_facts(
+                    user_id=user_id,
+                    query=q,
+                    limit=graph_limit,
+                    match_all_if_empty=False,
+                )
+            except Exception as e:
+                logger.warning("recall knowledge_graph search: %s", e)
+        # No query → no search injection (avoid full-graph dump on empty text)
 
         recent = [MemoryMessage(**m) for m in recent_raw]
         recent_ids = {m.message_id for m in recent}
@@ -241,41 +253,49 @@ def _format_memory_block(
     hits: list[SearchHit],
     gfacts: list[GraphFact],
 ) -> str:
-    lines: list[str] = []
+    """
+    Build prompt block only from DB hits. Empty hits → empty string (no inject).
+    """
+    body: list[str] = []
 
     if gfacts:
-        lines.append("KNOWLEDGE GRAPH (stable long-term facts — treat as true):")
+        body.append("DB HITS — knowledge graph (matched this query):")
         by_kind: dict[str, list[str]] = {}
         for g in gfacts:
             by_kind.setdefault(g.kind, []).append(g.text)
         for kind, items in by_kind.items():
-            lines.append(f"  {kind}:")
+            body.append(f"  {kind}:")
             for t in items:
-                lines.append(f"    - {t}")
-        lines.append("")
+                body.append(f"    - {t}")
+        body.append("")
 
     if recent:
-        lines.append("RECENT SESSION (exact transcript):")
+        body.append("RECENT TURNS (same session):")
         for m in recent:
             content = m.content if len(m.content) <= 500 else m.content[:500] + "…"
-            lines.append(f"- {m.role}: {content}")
-        lines.append("")
+            body.append(f"- {m.role}: {content}")
+        body.append("")
 
     if hits:
-        lines.append("RELATED PAST (search — may be older sessions):")
+        body.append("DB HITS — elasticsearch (matched this query):")
         for h in hits:
             content = h.content if len(h.content) <= 400 else h.content[:400] + "…"
             score = f"{h.score:.2f}" if h.score is not None else "?"
-            lines.append(f"- ({h.role}, score={score}) {content}")
-        lines.append("")
+            body.append(f"- ({h.role}, score={score}) {content}")
+        body.append("")
 
-    if not lines:
+    if not body:
+        # Critical: no forced "empty memory" essay — inject nothing.
         return ""
-    return (
-        "MEMORY (use these; do not contradict known facts; "
-        "prefer KNOWLEDGE GRAPH over fuzzy search hits):\n"
-        + "\n".join(lines)
-    ).strip()
+
+    rules = (
+        "MEMORY FROM DB SEARCH (only include if it answers THIS user message):\n"
+        "- These rows came from searching your stores with the user text — not a full dump.\n"
+        "- If a hit answers the question, use it in a short direct reply.\n"
+        "- If hits are unrelated to what they asked, ignore them.\n"
+        "- Do not invent past facts that are not in the hits."
+    )
+    return (rules + "\n\n" + "\n".join(body)).strip()
 
 
 def get_memory_service() -> AgentMemoryService:

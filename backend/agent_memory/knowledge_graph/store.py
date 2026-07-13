@@ -166,28 +166,67 @@ class GraphStore:
                     predicate=pred,
                 )
 
+    @staticmethod
+    def _query_tokens(query: str) -> list[str]:
+        """Tokens from user text for DB CONTAINS search — not an intent keyword list."""
+        toks = re.findall(r"[\w']+", (query or "").lower(), flags=re.UNICODE)
+        # keep short tokens too (city codes etc.) but drop pure 1-char noise
+        return list(dict.fromkeys(t for t in toks if len(t) >= 2))
+
     async def facts_for_user(self, user_id: str, limit: int = 30) -> list[dict[str, Any]]:
+        """Full dump (admin / debug). Chat path should use search_facts()."""
+        return await self.search_facts(user_id=user_id, query="", limit=limit, match_all_if_empty=True)
+
+    async def search_facts(
+        self,
+        *,
+        user_id: str,
+        query: str,
+        limit: int = 30,
+        match_all_if_empty: bool = False,
+    ) -> list[dict[str, Any]]:
         """
-        Generic MATCH use karte hain taaki empty DB pe
-        'relationship type does not exist' warnings na aayein.
-        (Neo4j warns jab pattern me :RELATES_TO / :HAS_CONSTRAINT etc.
-         pehli baar kabhi create na hue hon.)
+        Search Neo4j for this user with the query string.
+
+        Empty query + match_all_if_empty=False → [] (do not dump whole graph on chat).
+        Tokens matched via CONTAINS on entity names / fact texts / relation ends.
         """
         await self.connect()
         assert self._driver
+        tokens = self._query_tokens(query)
+        if not tokens and not match_all_if_empty:
+            return []
+
         out: list[dict[str, Any]] = []
         async with self._driver.session() as session:
-            # User se nikalte saare edges — type/label se classify
-            rec = await session.run(
-                """
-                MATCH (u:User {id: $user_id})-[r]->(n)
-                RETURN type(r) AS rel_type, labels(n) AS labels,
-                       n.name AS name, n.text AS text
-                LIMIT $limit
-                """,
-                user_id=user_id,
-                limit=max(limit * 3, 30),
-            )
+            if tokens:
+                # Query-driven: only nodes whose name/text contains a query token
+                rec = await session.run(
+                    """
+                    MATCH (u:User {id: $user_id})-[r]->(n)
+                    WHERE any(t IN $tokens WHERE
+                        (n.name IS NOT NULL AND toLower(toString(n.name)) CONTAINS t)
+                        OR (n.text IS NOT NULL AND toLower(toString(n.text)) CONTAINS t)
+                    )
+                    RETURN type(r) AS rel_type, labels(n) AS labels,
+                           n.name AS name, n.text AS text
+                    LIMIT $limit
+                    """,
+                    user_id=user_id,
+                    tokens=tokens,
+                    limit=max(limit * 3, 30),
+                )
+            else:
+                rec = await session.run(
+                    """
+                    MATCH (u:User {id: $user_id})-[r]->(n)
+                    RETURN type(r) AS rel_type, labels(n) AS labels,
+                           n.name AS name, n.text AS text
+                    LIMIT $limit
+                    """,
+                    user_id=user_id,
+                    limit=max(limit * 3, 30),
+                )
             async for row in rec:
                 rel_type = row["rel_type"] or ""
                 labels = list(row["labels"] or [])
@@ -217,20 +256,38 @@ class GraphStore:
                             }
                         )
 
-            # Entity ↔ Entity relations (bina :RELATES_TO hard pattern ke)
-            rec = await session.run(
-                """
-                MATCH (s:Entity {user_id: $user_id})-[r]->(o:Entity {user_id: $user_id})
-                WHERE type(r) = 'RELATES_TO'
-                   OR r.predicate IS NOT NULL
-                RETURN s.name AS subject,
-                       coalesce(r.predicate, type(r)) AS predicate,
-                       o.name AS object
-                LIMIT $limit
-                """,
-                user_id=user_id,
-                limit=limit,
-            )
+            if tokens:
+                rec = await session.run(
+                    """
+                    MATCH (s:Entity {user_id: $user_id})-[r]->(o:Entity {user_id: $user_id})
+                    WHERE (type(r) = 'RELATES_TO' OR r.predicate IS NOT NULL)
+                      AND any(t IN $tokens WHERE
+                        toLower(toString(s.name)) CONTAINS t
+                        OR toLower(toString(o.name)) CONTAINS t
+                        OR toLower(toString(coalesce(r.predicate, ''))) CONTAINS t
+                      )
+                    RETURN s.name AS subject,
+                           coalesce(r.predicate, type(r)) AS predicate,
+                           o.name AS object
+                    LIMIT $limit
+                    """,
+                    user_id=user_id,
+                    tokens=tokens,
+                    limit=limit,
+                )
+            else:
+                rec = await session.run(
+                    """
+                    MATCH (s:Entity {user_id: $user_id})-[r]->(o:Entity {user_id: $user_id})
+                    WHERE type(r) = 'RELATES_TO' OR r.predicate IS NOT NULL
+                    RETURN s.name AS subject,
+                           coalesce(r.predicate, type(r)) AS predicate,
+                           o.name AS object
+                    LIMIT $limit
+                    """,
+                    user_id=user_id,
+                    limit=limit,
+                )
             async for row in rec:
                 sub = row["subject"] or ""
                 pred = row["predicate"] or "RELATED_TO"
@@ -244,7 +301,6 @@ class GraphStore:
                         }
                     )
 
-        # dedupe by kind+text
         seen: set[str] = set()
         deduped: list[dict[str, Any]] = []
         for item in out:

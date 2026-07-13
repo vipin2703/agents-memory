@@ -1,25 +1,28 @@
 """
-vllm routes — chat + structured (+ live structured stream) + agent memory.
+vLLM routes — structured stream only.
+
+Agent memory + tools always enabled on the backend (not client-controlled).
 """
+
+from __future__ import annotations
 
 import json
 import logging
+import os
+import uuid
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
-from .client import (
-    get_health_info,
-    run_chat,
-    run_chat_stream,
-    run_chat_structured,
-    run_chat_structured_stream,
-)
-from .schemas import ChatRequest, ChatResponse, MemoryStatus, StructuredChatOutput
+from .client import get_health_info, run_chat_structured_stream
+from .schemas import ChatRequest, MemoryStatus
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["vllm"])
+
+# Backend policy — not from client flags
+DEFAULT_USER_ID = os.getenv("MEMORY_DEFAULT_USER_ID", "default-user")
 
 
 @router.get("/health")
@@ -27,51 +30,30 @@ def health_check():
     return get_health_info()
 
 
-def _wants_agent_memory(request: ChatRequest) -> bool:
-    return bool(
-        request.use_agent_memory
-        and request.user_id
-        and request.session_id
-    )
-
-
-async def _prepare_memory(request: ChatRequest, messages_dicts: list[dict]):
-    memory = request.memory.model_dump() if request.memory else None
-    extra_block = None
-    mem_status = MemoryStatus(enabled=False)
-    if not _wants_agent_memory(request):
-        return memory, extra_block, mem_status
-
-    from agent_memory.bridge import prepare_chat_memory
-
-    mem_status.enabled = True
-    prep = await prepare_chat_memory(
-        user_id=request.user_id,  # type: ignore[arg-type]
-        session_id=request.session_id,  # type: ignore[arg-type]
-        messages=messages_dicts,
-        client_memory=memory,
-    )
-    memory = prep["memory_dict"]
-    extra_block = prep.get("memory_block") or None
-    mem_status.recalled = bool(prep.get("recalled"))
-    mem_status.errors.extend(prep.get("errors") or [])
-    return memory, extra_block, mem_status
+def _resolve_identity(request: ChatRequest) -> tuple[str, str]:
+    """
+    Who is chatting. Client may pass user_id/session_id as identity only.
+    Backend always runs memory/tools — never a client on/off switch.
+    """
+    user_id = (request.user_id or "").strip() or DEFAULT_USER_ID
+    session_id = (request.session_id or "").strip() or str(uuid.uuid4())
+    return user_id, session_id
 
 
 async def _persist(
-    request: ChatRequest,
+    *,
+    user_id: str,
+    session_id: str,
     messages_dicts: list[dict],
     answer: str,
     extracted_facts,
     mem_status: MemoryStatus,
 ) -> MemoryStatus:
-    if not _wants_agent_memory(request):
-        return mem_status
     from agent_memory.bridge import latest_user_text, persist_chat_turn
 
     persist = await persist_chat_turn(
-        user_id=request.user_id,  # type: ignore[arg-type]
-        session_id=request.session_id,  # type: ignore[arg-type]
+        user_id=user_id,
+        session_id=session_id,
         user_text=latest_user_text(messages_dicts),
         assistant_text=answer,
         extracted_facts=extracted_facts,
@@ -82,80 +64,30 @@ async def _persist(
     return mem_status
 
 
-@router.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    try:
-        messages_dicts = [m.model_dump() for m in request.messages]
-        memory, extra_block, mem_status = await _prepare_memory(
-            request, messages_dicts
-        )
-        response_text = await run_chat(
-            messages_dicts,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            memory=memory,
-            extra_memory_block=extra_block,
-        )
-        await _persist(request, messages_dicts, response_text, None, mem_status)
-        return ChatResponse(response=response_text)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM upstream error: {e}")
-
-
-@router.post("/chat/structured", response_model=StructuredChatOutput)
-async def chat_structured(request: ChatRequest):
-    """Non-stream structured: full answer + facts (1 LLM call)."""
-    try:
-        messages_dicts = [m.model_dump() for m in request.messages]
-        memory, extra_block, mem_status = await _prepare_memory(
-            request, messages_dicts
-        )
-        result = await run_chat_structured(
-            messages_dicts,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            memory=memory,
-            extra_memory_block=extra_block,
-        )
-        mem_status = await _persist(
-            request,
-            messages_dicts,
-            result.answer,
-            result.extracted_facts,
-            mem_status,
-        )
-        result.memory_status = mem_status
-        return result
-    except Exception as e:
-        logger.exception("chat_structured failed")
-        raise HTTPException(status_code=502, detail=f"LLM upstream error: {e}")
-
-
 @router.post("/chat/structured/stream")
 async def chat_structured_stream(request: ChatRequest):
     """
-    Live answer tokens + final facts (still 1 LLM call).
+    SSE: answer_delta | tool_call | tool_result | final | error | [DONE]
 
-    SSE events (JSON lines):
-      {"type":"answer_delta","text":"..."}
-      {"type":"final","answer":"...","extracted_facts":{...},"memory_status":{...}}
-      {"type":"error","message":"..."}
-      [DONE]
+    Memory tools + persist always on (backend).
     """
     messages_dicts = [m.model_dump() for m in request.messages]
+    user_id, session_id = _resolve_identity(request)
 
     async def _gen():
+        # Always enabled — model decides whether to CALL tools, not client.
+        mem_status = MemoryStatus(enabled=True)
         try:
-            memory, extra_block, mem_status = await _prepare_memory(
-                request, messages_dicts
-            )
             final_payload = None
             async for event in run_chat_structured_stream(
                 messages_dicts,
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
-                memory=memory,
-                extra_memory_block=extra_block,
+                memory=None,  # no client fact bag
+                extra_memory_block=None,
+                tools_enabled=True,
+                user_id=user_id,
+                session_id=session_id,
             ):
                 if event.get("type") == "final":
                     final_payload = event
@@ -172,18 +104,28 @@ async def chat_structured_stream(request: ChatRequest):
                 return
 
             facts = final_payload.get("extracted_facts") or {}
+            tools_used = list(final_payload.get("tools_used") or [])
+            mem_status.tools_used = tools_used
+            mem_status.recalled = bool(final_payload.get("recalled")) or any(
+                t in tools_used
+                for t in ("search_conversation", "search_context", "search_memory")
+            )
             mem_status = await _persist(
-                request,
-                messages_dicts,
-                final_payload.get("answer") or "",
-                facts,
-                mem_status,
+                user_id=user_id,
+                session_id=session_id,
+                messages_dicts=messages_dicts,
+                answer=final_payload.get("answer") or "",
+                extracted_facts=facts,
+                mem_status=mem_status,
             )
             out = {
                 "type": "final",
                 "answer": final_payload.get("answer") or "",
                 "extracted_facts": facts,
                 "finish_reason": final_payload.get("finish_reason"),
+                "tools_used": tools_used,
+                "user_id": user_id,
+                "session_id": session_id,
                 "memory_status": mem_status.model_dump(),
             }
             yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
@@ -192,37 +134,5 @@ async def chat_structured_stream(request: ChatRequest):
             logger.exception("chat_structured_stream failed")
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
-
-    return StreamingResponse(_gen(), media_type="text/event-stream")
-
-
-@router.post("/chat/stream")
-async def chat_stream(request: ChatRequest):
-    messages_dicts = [m.model_dump() for m in request.messages]
-
-    async def _gen():
-        memory, extra_block, mem_status = await _prepare_memory(
-            request, messages_dicts
-        )
-        full: list[str] = []
-        async for chunk in run_chat_stream(
-            messages_dicts,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            memory=memory,
-            extra_memory_block=extra_block,
-        ):
-            if (
-                chunk.startswith("data: ")
-                and not chunk.startswith("data: [DONE]")
-                and not chunk.startswith("data: [ERROR]")
-            ):
-                full.append(chunk[len("data: ") :].rstrip("\n"))
-            yield chunk
-
-        if full:
-            await _persist(
-                request, messages_dicts, "".join(full).strip(), None, mem_status
-            )
 
     return StreamingResponse(_gen(), media_type="text/event-stream")

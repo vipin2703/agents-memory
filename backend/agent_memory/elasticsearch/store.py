@@ -107,8 +107,17 @@ class SearchStore:
         user_id: str,
         query: str,
         session_id: str | None = None,
+        role: str | None = None,
         limit: int = 10,
+        min_score: float | None = None,
+        min_score_ratio: float = 0.35,
     ) -> list[dict[str, Any]]:
+        """
+        BM25 search over stored messages for this user.
+        Weak / noise hits dropped via relative score floor (no intent hardcoding).
+        Pass role="user" to recall only what the user themselves said (avoids
+        echoing the assistant's own past — possibly wrong — replies).
+        """
         if not (query or "").strip():
             return []
         await self.connect()
@@ -117,8 +126,10 @@ class SearchStore:
         filters: list[dict[str, Any]] = [{"term": {"user_id": user_id}}]
         if session_id:
             filters.append({"term": {"session_id": session_id}})
+        if role:
+            filters.append({"term": {"role": role}})
 
-        body = {
+        body: dict[str, Any] = {
             "size": limit,
             "query": {
                 "bool": {
@@ -136,13 +147,29 @@ class SearchStore:
                 }
             },
         }
+        if min_score is not None:
+            body["min_score"] = min_score
+
         try:
             res = await self._client.search(index=self.index, body=body)
         except NotFoundError:
             return []
 
+        raw_hits = res.get("hits", {}).get("hits", []) or []
+        if not raw_hits:
+            return []
+
+        top = float(raw_hits[0].get("_score") or 0.0)
+        # Relative floor: keep hits that are actually competitive with the best match
+        floor = max(0.5, top * min_score_ratio) if top > 0 else 0.5
+        if min_score is not None:
+            floor = max(floor, min_score)
+
         hits = []
-        for h in res.get("hits", {}).get("hits", []):
+        for h in raw_hits:
+            score = float(h.get("_score") or 0.0)
+            if score < floor:
+                continue
             src = h.get("_source") or {}
             hits.append(
                 {
@@ -151,7 +178,7 @@ class SearchStore:
                     "user_id": src.get("user_id", user_id),
                     "role": src.get("role", ""),
                     "content": src.get("content", ""),
-                    "score": h.get("_score"),
+                    "score": score,
                 }
             )
         return hits

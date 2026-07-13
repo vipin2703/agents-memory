@@ -63,6 +63,36 @@ class SqlStore:
                 "hint": "Run memory-migrate (schema.sql) before app start",
             }
 
+    async def create_user(self, *, username: str, password_hash: str) -> bool:
+        """Insert a new user. Returns False if the username already exists."""
+        await self.connect()
+        assert self._pool
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO users (username, password_hash)
+                VALUES ($1, $2)
+                ON CONFLICT (username) DO NOTHING
+                RETURNING username
+                """,
+                username,
+                password_hash,
+            )
+        return row is not None
+
+    async def get_user(self, username: str) -> dict[str, Any] | None:
+        """Fetch a user row (for password verification), or None."""
+        await self.connect()
+        assert self._pool
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT username, password_hash FROM users WHERE username = $1",
+                username,
+            )
+        if not row:
+            return None
+        return {"username": row["username"], "password_hash": row["password_hash"]}
+
     async def ensure_session(self, session_id: str, user_id: str) -> None:
         assert self._pool
         async with self._pool.acquire() as conn:

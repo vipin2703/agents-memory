@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from agent_memory.client import memory_shutdown, memory_startup
 from agent_memory.routes import router as memory_router
+from auth.routes import router as auth_router
 from vllm.routes import router as vllm_router
 
 
@@ -27,6 +28,7 @@ app.add_middleware(
 
 app.include_router(vllm_router)
 app.include_router(memory_router)
+app.include_router(auth_router)
 
 
 if __name__ == "__main__":

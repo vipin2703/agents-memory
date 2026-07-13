@@ -4,9 +4,63 @@ services:
 #  # -----------------------------------------------------------
 #  # vLLM SERVER -- model load karta h, HTTP endpoint expose karta
 #  # -----------------------------------------------------------
+  # -----------------------------------------------------------
+  # GEMMA (safetensors) — commented out; using Phi-4 below instead.
+  # -----------------------------------------------------------
+  # vllm-server:
+  #   image: ${VLLM_IMAGE}
+  #   container_name: vllm_gemma_server
+  #   runtime: nvidia
+  #   ipc: host
+  #   ports:
+  #     - "${PORT}:${PORT}"
+  #   volumes:
+  #     - "${MODEL_HOST_PATH}:${MODEL_CONTAINER_PATH}"
+  #   environment:
+  #     - NVIDIA_VISIBLE_DEVICES=all
+  #     - VLLM_LOGGING_LEVEL=DEBUG
+  #     - VLLM_STRICT_WEIGHTS=0
+  #     - VLLM_DISABLE_WEIGHT_VALIDATION=1
+  #   command:
+  #     - "--model"
+  #     - "${MODEL_CONTAINER_PATH}"
+  #     - "--served-model-name"
+  #     - "${SERVED_MODEL_NAME}"
+  #     - "--kv-cache-dtype"
+  #     - "${KV_CACHE_DTYPE}"
+  #     - "--max-num-batched-tokens"
+  #     - "${MAX_NUM_BATCHED_TOKENS}"
+  #     - "--max-model-len"
+  #     - "${MAX_MODEL_LEN}"
+  #     - "--tensor-parallel-size"
+  #     - "${TENSOR_PARALLEL_SIZE}"
+  #     - "--gpu-memory-utilization"
+  #     - "${GPU_MEMORY_UTILIZATION}"
+  #     - "--host"
+  #     - "${HOST}"
+  #     - "--port"
+  #     - "${PORT}"
+  #     - "--load-format"
+  #     - "safetensors"
+  #     - "--structured-outputs-config.backend"
+  #     - "xgrammar"
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+
+  # -----------------------------------------------------------
+  # PHI-4-mini (GGUF via custom Dockerfile) — ACTIVE.
+  # Better tool-calling + extraction than gemma-3-1b.
+  # -----------------------------------------------------------
   vllm-server:
-    image: ${VLLM_IMAGE}
-    container_name: vllm_gemma_server
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vllm_phi4_server
     runtime: nvidia
     ipc: host
     ports:
@@ -16,31 +70,25 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - VLLM_LOGGING_LEVEL=DEBUG
-      - VLLM_STRICT_WEIGHTS=0
-      - VLLM_DISABLE_WEIGHT_VALIDATION=1
     command:
-      - "--model"
-      - "${MODEL_CONTAINER_PATH}"
+      - "${MODEL_CONTAINER_PATH}/${GGUF_FILE_NAME}"
+      - "--tokenizer"
+      - "${BASE_MODEL_ID}"
       - "--served-model-name"
       - "${SERVED_MODEL_NAME}"
-      - "--kv-cache-dtype"
-      - "${KV_CACHE_DTYPE}"
-      - "--max-num-batched-tokens"
-      - "${MAX_NUM_BATCHED_TOKENS}"
+      - "--dtype"
+      - "float16"
       - "--max-model-len"
       - "${MAX_MODEL_LEN}"
-      - "--tensor-parallel-size"
-      - "${TENSOR_PARALLEL_SIZE}"
       - "--gpu-memory-utilization"
       - "${GPU_MEMORY_UTILIZATION}"
+      - "--enforce-eager"
+      - "--structured-outputs-config.backend"
+      - "xgrammar"
       - "--host"
       - "${HOST}"
       - "--port"
       - "${PORT}"
-      - "--load-format"
-      - "safetensors"
-      - "--structured-outputs-config.backend"
-      - "xgrammar"
     deploy:
       resources:
         reservations:
@@ -238,7 +286,8 @@ services:
     env_file:
       - .env
     ports:
-      - "8080:9000"
+      # GraphXR Lite serves its web UI on container port 8000 (not 9000).
+      - "8080:8000"
     volumes:
       - agent_memory_graphxr_data:/data
     environment:

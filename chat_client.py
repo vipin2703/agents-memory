@@ -1,11 +1,14 @@
 """
-chat_client.py — live token print via /chat/structured/stream + server memory.
+chat_client.py — thin client for POST /chat/structured/stream.
+
+Does NOT decide memory on/off. Backend always runs agent memory + tools;
+the model decides whether to call tools.
 """
 
 from __future__ import annotations
 
+import getpass
 import json
-import uuid
 
 import requests
 
@@ -13,90 +16,75 @@ BASE = "http://localhost:5000"
 CHAT_STREAM_URL = f"{BASE}/chat/structured/stream"
 MEMORY_HEALTH = f"{BASE}/memory/health"
 MEMORY_RECALL = f"{BASE}/memory/recall"
+AUTH_REGISTER = f"{BASE}/auth/register"
+AUTH_LOGIN = f"{BASE}/auth/login"
 
-USER_ID = "local-user"
-SESSION_ID = str(uuid.uuid4())
+# Identity — set after login (name + password). Each user's memory is isolated
+# under their username in Postgres / Elasticsearch / Neo4j.
+USER_ID = ""
+SESSION_ID = ""
 HISTORY_WINDOW = 12
 
 messages: list[dict] = []
-facts: dict = {
-    "entities": [],
-    "facts_about_user": [],
-    "constraints": [],
-    "relations": [],
-}
 
 
-def merge_facts(new_facts: dict):
-    if not isinstance(new_facts, dict):
-        return
-    for category in ("entities", "facts_about_user", "constraints"):
-        if category not in facts:
-            facts[category] = []
-        new_items = new_facts.get(category) or []
-        if not isinstance(new_items, list):
+def authenticate() -> None:
+    """Prompt for register/login, then set USER_ID / SESSION_ID from the server."""
+    global USER_ID, SESSION_ID
+    print("=== Login ===  (new user? type 'register')")
+    while True:
+        mode = input("login / register: ").strip().lower() or "login"
+        if mode not in ("login", "register"):
+            print("  type 'login' or 'register'")
             continue
-        for item in new_items:
-            if not item:
-                continue
-            existing_lower = {x.lower() for x in facts[category]}
-            if str(item).lower() not in existing_lower:
-                facts[category].append(item)
-    # relations: list of {subject, predicate, object}
-    if "relations" not in facts:
-        facts["relations"] = []
-    for r in new_facts.get("relations") or []:
-        if not isinstance(r, dict):
+        username = input("username: ").strip()
+        password = getpass.getpass("password: ")
+        if not username or not password:
+            print("  username and password required")
             continue
-        sub = str(r.get("subject") or "").strip()
-        pred = str(r.get("predicate") or "").strip()
-        obj = str(r.get("object") or "").strip()
-        if not sub or not obj:
-            continue
-        key = f"{sub.lower()}|{pred.lower()}|{obj.lower()}"
-        existing = {
-            f"{x.get('subject','').lower()}|{x.get('predicate','').lower()}|{x.get('object','').lower()}"
-            for x in facts["relations"]
-            if isinstance(x, dict)
-        }
-        if key not in existing:
-            facts["relations"].append(
-                {"subject": sub, "predicate": pred, "object": obj}
+        url = AUTH_REGISTER if mode == "register" else AUTH_LOGIN
+        try:
+            r = requests.post(
+                url, json={"username": username, "password": password}, timeout=30
             )
-
-
-def print_facts_summary():
-    if not any(facts.get(k) for k in facts):
-        print("\n(Local facts cache empty — server KG alag ho sakta hai)\n")
-        return
-    print("\n--- LOCAL FACTS CACHE ---")
-    for category, items in facts.items():
-        if items:
-            print(f"  {category}: {items}")
-    print("---------------------------\n")
+        except requests.exceptions.RequestException as e:
+            print(f"  [ERROR] backend unreachable: {e}")
+            continue
+        if r.status_code == 200:
+            data = r.json()
+            USER_ID = data["user_id"]
+            SESSION_ID = data["session_id"]
+            who = "Registered" if data.get("new_user") else "Logged in"
+            print(f"  {who} as {USER_ID}\n")
+            return
+        try:
+            detail = r.json().get("detail")
+        except Exception:
+            detail = r.text
+        print(f"  [{r.status_code}] {detail}")
 
 
 def windowed_messages() -> list[dict]:
+    """Last N turns; window must start with user (vLLM role alternate)."""
     if len(messages) <= HISTORY_WINDOW:
-        return list(messages)
-    return list(messages[-HISTORY_WINDOW:])
+        out = list(messages)
+    else:
+        out = list(messages[-HISTORY_WINDOW:])
+    while out and out[0].get("role") != "user":
+        out.pop(0)
+    while len(out) >= 2 and out[-1].get("role") == out[-2].get("role"):
+        out.pop(-2)
+    return out
 
 
 def send_query(user_input: str) -> tuple[str, dict, dict | None]:
     messages.append({"role": "user", "content": user_input})
 
+    # Minimal payload — no use_agent_memory, no client memory bag, no max_tokens
     payload = {
         "messages": windowed_messages(),
-        "memory": {
-            "entities": list(facts["entities"]),
-            "facts_about_user": list(facts["facts_about_user"]),
-            "constraints": list(facts["constraints"]),
-            "relations": list(facts.get("relations") or []),
-        },
         "user_id": USER_ID,
         "session_id": SESSION_ID,
-        "use_agent_memory": True,
-        "max_tokens": 2048,
     }
 
     answer = ""
@@ -136,8 +124,19 @@ def send_query(user_input: str) -> tuple[str, dict, dict | None]:
                     text = event.get("text") or ""
                     print(text, end="", flush=True)
                     answer += text
+                elif etype == "tool_call":
+                    name = event.get("name") or "?"
+                    print(f"\n[tool → {name}]", end="", flush=True)
+                elif etype == "tool_result":
+                    name = event.get("name") or "?"
+                    print(f" [ok:{name}]\nBot: ", end="", flush=True)
+                    answer = ""
                 elif etype == "final":
-                    answer = event.get("answer") or answer
+                    final_ans = event.get("answer") or ""
+                    if final_ans and final_ans != answer:
+                        if not answer.strip():
+                            print(final_ans, end="", flush=True)
+                        answer = final_ans
                     extracted = event.get("extracted_facts") or {}
                     mem_status = event.get("memory_status")
                 elif etype == "error":
@@ -150,21 +149,23 @@ def send_query(user_input: str) -> tuple[str, dict, dict | None]:
             messages.pop()
         raise
 
-    merge_facts(extracted)
     messages.append({"role": "assistant", "content": answer})
     return answer, extracted, mem_status
 
 
 def server_recall(query: str | None = None):
-    payload = {
-        "user_id": USER_ID,
-        "session_id": SESSION_ID,
-        "query": query,
-        "recent_limit": 20,
-        "search_limit": 10,
-        "graph_limit": 40,
-    }
-    r = requests.post(MEMORY_RECALL, json=payload, timeout=60)
+    r = requests.post(
+        MEMORY_RECALL,
+        json={
+            "user_id": USER_ID,
+            "session_id": SESSION_ID,
+            "query": query,
+            "recent_limit": 20,
+            "search_limit": 10,
+            "graph_limit": 40,
+        },
+        timeout=60,
+    )
     r.raise_for_status()
     return r.json()
 
@@ -186,10 +187,11 @@ def server_clear_user():
 
 
 def main():
-    print("Chat + live stream + server agent memory")
+    authenticate()
+    print("Chat stream (memory/tools = backend always on; model chooses tools)")
     print(f"  user_id    = {USER_ID}")
     print(f"  session_id = {SESSION_ID}")
-    print("  facts / health / recall / clear / wipe / exit\n")
+    print("  health / recall / clear / wipe / exit\n")
 
     while True:
         try:
@@ -204,13 +206,9 @@ def main():
         if low in ("exit", "quit"):
             print("Bye!")
             break
-        if low == "facts":
-            print_facts_summary()
-            continue
         if low == "health":
             try:
-                h = requests.get(MEMORY_HEALTH, timeout=30).json()
-                print(json.dumps(h, indent=2, ensure_ascii=False))
+                print(json.dumps(requests.get(MEMORY_HEALTH, timeout=30).json(), indent=2))
             except Exception as e:
                 print(f"\n[ERROR] {e}\n")
             continue
@@ -226,35 +224,29 @@ def main():
             continue
         if low == "clear":
             messages.clear()
-            for k in facts:
-                facts[k] = []
             try:
                 server_clear_session()
                 print("\n(Local + session clear; KG kept)\n")
             except Exception as e:
-                print(f"\n(Local clear; server failed: {e})\n")
+                print(f"\n(Local clear; server: {e})\n")
             continue
         if low == "wipe":
             messages.clear()
-            for k in facts:
-                facts[k] = []
             try:
                 server_clear_user()
                 print("\n(Full user wipe)\n")
             except Exception as e:
-                print(f"\n(Local clear; server failed: {e})\n")
+                print(f"\n(Local clear; server: {e})\n")
             continue
 
         try:
             _answer, turn_facts, mem_status = send_query(user_input)
-            print("--- this turn new facts ---")
+            print("--- extracted_facts (this turn) ---")
             print(json.dumps(turn_facts, indent=2, ensure_ascii=False))
             if mem_status:
                 print("--- memory_status ---")
                 print(json.dumps(mem_status, indent=2, ensure_ascii=False))
-            print("--- local facts cache ---")
-            print(json.dumps(facts, indent=2, ensure_ascii=False))
-            print("-------------------------\n")
+            print("----------------------------------\n")
         except requests.exceptions.RequestException as e:
             print(f"\n[ERROR] Backend: {e}\n")
         except Exception as e:

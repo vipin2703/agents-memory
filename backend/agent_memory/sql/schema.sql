@@ -2,6 +2,14 @@
 -- Apply ONCE via memory-migrate service / manual psql — NOT from app code.
 -- Safe to re-run: IF NOT EXISTS throughout.
 
+-- Registered users. user_id everywhere (sessions/messages/graph/ES) = username.
+-- password_hash format: "pbkdf2_sha256$<iterations>$<salt_hex>$<hash_hex>".
+CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
