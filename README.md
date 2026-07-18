@@ -1,6 +1,8 @@
 # Local LLM Stack + Agent Memory
 
-Local Docker stack: **chat client → FastAPI backend → vLLM (GPU)** with **agent memory** (SQL + Elasticsearch + Neo4j), **GraphXR 3D**, and optional **Langfuse** tracing.
+Local Docker stack: **chat client → FastAPI backend → LLM** with **agent memory** (SQL + Elasticsearch + Neo4j), **GraphXR 3D**, and optional **Langfuse** tracing.
+
+Inference is pluggable — the backend speaks the OpenAI API, so the LLM can be a **local vLLM (GPU)** or **any hosted OpenAI-compatible API** (Gemini, OpenRouter, …). See [§2 Inference backends](#2-inference-backends--two-interchangeable-methods).
 
 ---
 
@@ -52,7 +54,61 @@ Local Docker stack: **chat client → FastAPI backend → vLLM (GPU)** with **ag
 
 ---
 
-## 2. Environment files (secrets yahan — compose me hardcode nahi)
+## 2. Inference backends — two interchangeable methods
+
+The backend talks to the model over the **OpenAI Chat Completions API**, so the
+**same code** runs against a local model or a hosted API. Switch by editing only
+`backend/vllm/.env` (`BASE_URL`, `API_KEY`, `MODEL_NAME`) — nothing else changes.
+
+### Method A — Local vLLM (GPU) + guided JSON  *(original)*
+
+Weights loaded locally by `vllm-server`; structured output enforced server-side by
+**xgrammar guided JSON** → guaranteed shape.
+
+```env
+# backend/vllm/.env
+BASE_URL=http://vllm-server:8000/v1
+API_KEY=not-needed
+MODEL_NAME=phi-4-mini            # = SERVED_MODEL_NAME in config/.env
+```
+
+- Needs a GPU + the `vllm-server` container.
+- Best JSON reliability, fully offline, no per-token cost.
+
+### Method B — Hosted OpenAI-compatible API  *(added)*
+
+Point the same backend at any hosted provider — **no GPU, no `vllm-server`**.
+
+```env
+# backend/vllm/.env — pick ONE provider
+
+# Google Gemini (OpenAI-compat endpoint)
+BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+API_KEY=<your-gemini-key>
+MODEL_NAME=gemini-1.5-flash
+
+# OpenRouter (many models incl. free tiers)
+BASE_URL=https://openrouter.ai/api/v1
+API_KEY=<your-openrouter-key>
+MODEL_NAME=nvidia/nemotron-3-ultra-550b-a55b:free
+```
+
+- No server-side grammar available, so shape is enforced by the **strict system
+  prompt + a lenient parser** (`backend/vllm/client.py`).
+- **Streaming vs `json_object`** — toggle `JSON_OBJECT_MODE` in `client.py`:
+  - `False` *(default)* → live **token-by-token streaming**. Many providers
+    **buffer the whole reply** to validate `response_format=json_object`, which
+    kills streaming — so we skip it and rely on the prompt.
+  - `True` → hard JSON guarantee, but the answer arrives **all at once** (no stream).
+- A **hybrid streamer** shows tokens live whether the model emits a JSON object
+  (answer field extracted live) or plain prose.
+
+> **Switch method:** edit `backend/vllm/.env`, then recreate the backend:
+> `cd config && docker compose up -d --force-recreate --no-deps client`
+
+---
+
+## 3. Environment files (secrets yahan — compose me hardcode nahi)
 
 Docker Compose **`config/`** se chalta hai → variable substitution + `env_file` ke liye **`config/.env`**.
 
@@ -76,7 +132,7 @@ Templates: `*.env.example` — wahan se copy karke **apni** values bharo.
 
 ---
 
-## 3. Run
+## 4. Run
 
 1. **Env copy / fill**
    ```text
@@ -142,7 +198,7 @@ docker compose run --rm neo4j-migrate
 
 ---
 
-## 4. GraphXR 3D (Neo4j)
+## 5. GraphXR 3D (Neo4j)
 
 [GraphXR Lite](https://github.com/Kineviz/graphxr-lite) — self-hosted 3D UI over **same** agent-memory Neo4j.
 
@@ -168,7 +224,7 @@ Flow:
 
 ---
 
-## 5. One chat turn (agent memory)
+## 6. One chat turn (agent memory)
 
 ```
 You type message
@@ -205,7 +261,7 @@ docker logs -f llm_serve
 
 ---
 
-## 6. Agent memory design
+## 7. Agent memory design
 
 | Store | What | Write |
 |-------|------|--------|
@@ -244,7 +300,7 @@ docker logs -f llm_serve
 
 ---
 
-## 7. Backend layout
+## 8. Backend layout
 
 ```
 main.py
@@ -271,7 +327,7 @@ Naye packages → `docker compose up -d --build client`.
 
 ---
 
-## 8. Langfuse (side path)
+## 9. Langfuse (side path)
 
 ```
 LLM → Langfuse SDK → langfuse-web:3000 → Redis → worker:3030
@@ -283,7 +339,7 @@ Langfuse DB ≠ product DB name: chat truth = Postgres DB **`agent_memory`**.
 
 ---
 
-## 9. Project structure
+## 10. Project structure
 
 ```
 rag/
@@ -306,7 +362,7 @@ rag/
 
 ---
 
-## 10. Cloud note
+## 11. Cloud note
 
 Local: compose + `config/.env` + migrate services.  
 Cloud: same schema files; migrate = CI/K8s Job; secrets = vault/env (not compose hardcode); GraphXR optional separate deploy.
