@@ -83,8 +83,6 @@ async def chat_structured_stream(request: ChatRequest):
                 messages_dicts,
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
-                memory=None,  # no client fact bag
-                extra_memory_block=None,
                 tools_enabled=True,
                 user_id=user_id,
                 session_id=session_id,

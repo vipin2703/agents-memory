@@ -92,13 +92,19 @@ async def _search_context(ctx: ToolContext, args: dict[str, Any]) -> str:
             limit=20,
             match_all_if_empty=False,
         )
+        # Self / identity questions ("my name", "where do I work") rarely share
+        # tokens with the stored facts — the name is an Entity node, not text that
+        # literally contains "name". When the query matched nothing, fall back to
+        # this user's whole known profile so the model can still answer.
+        if not facts:
+            facts = await svc.graph.facts_for_user(ctx.user_id, limit=20)
     except Exception as e:
         logger.exception("search_context failed")
         return f"search_context ERROR: {e}"
 
     if not facts:
         return (
-            f"search_context: no graph hits for query={query!r}. "
+            "search_context: nothing stored for this user yet. "
             "Tell the user you don't have that in context memory."
         )
 

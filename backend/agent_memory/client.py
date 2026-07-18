@@ -3,7 +3,7 @@ Thin facade — routes yahi se service call karti hain.
 Stores alag packages me: sql / elasticsearch / knowledge_graph.
 """
 
-from .bridge import persist_chat_turn, prepare_chat_memory
+from .bridge import persist_chat_turn
 from .schemas import (
     MemoryHealth,
     MemoryRecallRequest,
@@ -59,6 +59,5 @@ __all__ = [
     "memory_shutdown",
     "clear_session",
     "clear_user",
-    "prepare_chat_memory",
     "persist_chat_turn",
 ]
